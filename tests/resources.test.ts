@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -496,5 +496,50 @@ describe("sevdesk_create_voucher", () => {
     )) as { wouldSend: { body: Record<string, unknown> } };
 
     expect(out.wouldSend.body).not.toHaveProperty("filename");
+  });
+});
+
+describe("sevdesk_upload_voucher_file", () => {
+  const upload = resourceTools.find((t) => t.name === "sevdesk_upload_voucher_file")!;
+
+  it("returns the filename token without sevDesk's base64 preview", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sevdesk-mcp-test-"));
+    const file = join(dir, "beleg.pdf");
+    await writeFile(file, "%PDF-1.4 test");
+
+    const ctx = {
+      client: {
+        async request(): Promise<{ status: number; data: unknown }> {
+          return {
+            status: 201,
+            // sevDesk renders the upload and echoes the preview back — tens of
+            // thousands of base64 characters the caller has no use for.
+            data: {
+              objects: {
+                filename: "abc123hash.pdf",
+                contentHash: "deadbeef",
+                pages: 1,
+                content: ["/9j/4AAQSkZJRgABAQEAyADIAAD".repeat(500)],
+              },
+            },
+          };
+        },
+      },
+      config: {
+        baseUrl: "https://example.test/api/v1",
+        readOnly: false,
+        dryRun: false,
+        allowedReceiptDirs: [dir],
+      },
+      getProfile: async () => stubProfile(),
+    } as unknown as ToolContext;
+
+    const out = (await upload.handler({ filePath: file }, ctx)) as {
+      response: { objects: Record<string, unknown> };
+    };
+
+    expect(out.response.objects.filename).toBe("abc123hash.pdf");
+    expect(out.response.objects.contentHash).toBe("deadbeef");
+    expect(out.response.objects).not.toHaveProperty("content");
   });
 });
