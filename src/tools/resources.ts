@@ -33,6 +33,13 @@ const VOUCHER_RULE_IDS = Object.entries(TAX_RULES)
   .filter(([, r]) => r.usableInVouchers)
   .map(([id]) => id as TaxRuleId);
 
+/**
+ * sevDesk's default rule per voucher side: the two rules the legacy
+ * `taxType: "default"` mapped to. A voucher is an expense unless it is a
+ * debit, so the expense rule is the one to fall back to.
+ */
+const DEFAULT_VOUCHER_RULE: Record<"C" | "D", TaxRuleId> = { C: "9", D: "1" };
+
 /** Fetch a single document and refuse to hand it out for editing when it is enshrined. */
 async function fetchUnenshrined(
   ctx: ToolContext,
@@ -558,7 +565,13 @@ const createVoucher: ToolDef = {
       supplierName: str("Supplier name as it should appear on the voucher."),
       voucherDate: str("Voucher date, dd.mm.yyyy."),
       description: str("Document/invoice number."),
-      taxRuleId: str("VAT regulation id.", { enum: ["1", "2", "3", "4", "5", "11"] }),
+      taxRuleId: str(
+        `VAT regulation id — every rule sevDesk accepts on a voucher, both sides. ` +
+          `sevdesk_receipt_guidance lists the ones the booking account actually allows. ` +
+          `Defaults to ${DEFAULT_VOUCHER_RULE.C} (deductible expense) for creditDebit C ` +
+          `and ${DEFAULT_VOUCHER_RULE.D} for D.`,
+        { enum: VOUCHER_RULE_IDS },
+      ),
       creditDebit: str("C = credit, D = debit.", { enum: ["C", "D"] }),
       status: str("50 = Entwurf, 100 = offen, 1000 = bezahlt (default 50).", {
         enum: ["50", "100", "1000"],
@@ -590,7 +603,10 @@ const createVoucher: ToolDef = {
     if (!positionsIn.length) throw new Error("At least one position is required.");
 
     const status = optString(args, "status") ?? "50";
-    const taxRuleId = optString(args, "taxRuleId") ?? "1";
+    const creditDebit = optString(args, "creditDebit") === "D" ? "D" : "C";
+    // An expense voucher defaulting to rule 1 ("Umsatzsteuerpflichtige Umsätze")
+    // books it under a revenue rule — default per side instead.
+    const taxRuleId = optString(args, "taxRuleId") ?? DEFAULT_VOUCHER_RULE[creditDebit];
 
     const voucher: Row = {
       objectName: "Voucher",
@@ -600,7 +616,7 @@ const createVoucher: ToolDef = {
       description: optString(args, "description"),
       status,
       taxRule: { id: taxRuleId, objectName: "TaxRule" },
-      creditDebit: optString(args, "creditDebit") ?? "C",
+      creditDebit,
       voucherType: "VOU",
       ...(optString(args, "payDate") ? { payDate: optString(args, "payDate") } : {}),
       ...((args.extra as Row | undefined) ?? {}),
