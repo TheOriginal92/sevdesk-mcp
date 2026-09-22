@@ -528,7 +528,17 @@ const uploadVoucherFile: ToolDef = {
       form,
       mutating: true,
     });
-    return { uploaded: basename(path), bytes: info.size, response: data };
+    // sevDesk echoes a rendered preview of the upload back in `content` —
+    // tens of thousands of base64 characters that are worthless to a caller
+    // who needs the filename token. Keep the metadata, drop the blob.
+    const objects = (data as Row | undefined)?.objects as Row | undefined;
+    let response: unknown = data;
+    if (objects && typeof objects === "object") {
+      const meta: Row = { ...objects };
+      delete meta.content;
+      response = { objects: meta };
+    }
+    return { uploaded: basename(path), bytes: info.size, response };
   },
 };
 
