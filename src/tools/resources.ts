@@ -593,7 +593,6 @@ const createVoucher: ToolDef = {
       creditDebit: optString(args, "creditDebit") ?? "C",
       voucherType: "VOU",
       ...(optString(args, "payDate") ? { payDate: optString(args, "payDate") } : {}),
-      ...(optString(args, "fileName") ? { fileName: optString(args, "fileName") } : {}),
       ...((args.extra as Row | undefined) ?? {}),
     };
 
@@ -613,7 +612,17 @@ const createVoucher: ToolDef = {
       };
     });
 
-    const payload = { voucher, voucherPosSave, voucherPosDelete: null };
+    // sevDesk takes the uploaded receipt as a TOP-LEVEL `filename` on the
+    // saveVoucher payload (schema `saveVoucher`), not as a voucher field —
+    // put in the wrong place it is silently ignored and the voucher is
+    // created without its document.
+    const attachment = optString(args, "fileName");
+    const payload = {
+      voucher,
+      voucherPosSave,
+      voucherPosDelete: null,
+      ...(attachment ? { filename: attachment } : {}),
+    };
 
     if (isDryRun(args, ctx)) {
       return { dryRun: true, wouldSend: { method: "POST", path: "/Voucher/Factory/saveVoucher", body: payload } };

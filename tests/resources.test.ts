@@ -465,3 +465,36 @@ describe("sevdesk_summarize", () => {
     );
   });
 });
+
+describe("sevdesk_create_voucher", () => {
+  const createVoucher = resourceTools.find((t) => t.name === "sevdesk_create_voucher")!;
+
+  const args = {
+    supplierName: "Acme Ltd",
+    voucherDate: "01.09.2026",
+    positions: [{ sumNet: 100, taxRate: 19 }],
+    dryRun: true,
+  };
+
+  it("attaches an uploaded receipt as a top-level 'filename'", async () => {
+    const out = (await createVoucher.handler(
+      { ...args, fileName: "abc123hash.pdf" },
+      ctxWith(() => ({ status: 200, data: {} })),
+    )) as { wouldSend: { body: Record<string, unknown> } };
+
+    // sevDesk's saveVoucher schema puts the attachment next to `voucher`,
+    // not inside it — in the wrong place it is silently dropped.
+    expect(out.wouldSend.body.filename).toBe("abc123hash.pdf");
+    expect(out.wouldSend.body.voucher).not.toHaveProperty("fileName");
+    expect(out.wouldSend.body.voucher).not.toHaveProperty("filename");
+  });
+
+  it("omits 'filename' entirely when no receipt was uploaded", async () => {
+    const out = (await createVoucher.handler(
+      args,
+      ctxWith(() => ({ status: 200, data: {} })),
+    )) as { wouldSend: { body: Record<string, unknown> } };
+
+    expect(out.wouldSend.body).not.toHaveProperty("filename");
+  });
+});
