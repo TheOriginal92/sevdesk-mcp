@@ -489,6 +489,36 @@ describe("sevdesk_create_voucher", () => {
     expect(out.wouldSend.body.voucher).not.toHaveProperty("filename");
   });
 
+  it("defaults an expense voucher to the expense rule, not the revenue one", async () => {
+    const out = (await createVoucher.handler(
+      args,
+      ctxWith(() => ({ status: 200, data: {} })),
+    )) as { wouldSend: { body: { voucher: Record<string, Row> } } };
+
+    // Rule 1 is "Umsatzsteuerpflichtige Umsätze" — the revenue side. A credit
+    // voucher is an expense, where the equivalent default is rule 9.
+    expect(out.wouldSend.body.voucher.taxRule).toEqual({ id: "9", objectName: "TaxRule" });
+  });
+
+  it("keeps rule 1 as the default for a debit (revenue) voucher", async () => {
+    const out = (await createVoucher.handler(
+      { ...args, creditDebit: "D" },
+      ctxWith(() => ({ status: 200, data: {} })),
+    )) as { wouldSend: { body: { voucher: Record<string, Row> } } };
+
+    expect(out.wouldSend.body.voucher.taxRule).toEqual({ id: "1", objectName: "TaxRule" });
+  });
+
+  it("offers the expense-side rules its own description points at", async () => {
+    const rules = (createVoucher.inputSchema.properties.taxRuleId as { enum: string[] }).enum;
+
+    // sevDesk's ReceiptGuidance returns these for expense accounts; the spec's
+    // Model_Voucher enum lists only the revenue side, which is what this
+    // schema used to copy.
+    expect(rules).toEqual(expect.arrayContaining(["9", "10", "12", "13", "14"]));
+    expect(rules).toEqual(expect.arrayContaining(["1", "11"]));
+  });
+
   it("omits 'filename' entirely when no receipt was uploaded", async () => {
     const out = (await createVoucher.handler(
       args,
