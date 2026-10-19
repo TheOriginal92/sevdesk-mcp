@@ -20,6 +20,11 @@ jobs:
           cache: npm
           registry-url: https://registry.npmjs.org
 
+      # Trusted Publishing needs npm >= 11.5.1 for the OIDC token exchange.
+      # Node 22 bundles npm 10, whose publish then goes out unauthenticated
+      # and fails with a misleading 404 (seen on the first v0.5.0 run).
+      - run: npm install -g npm@11.21.0
+
       - run: npm ci
       - run: npm run build
       - run: npm test
