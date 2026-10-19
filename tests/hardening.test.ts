@@ -725,3 +725,99 @@ describe("round 5", () => {
     expect(bad).toEqual([]);
   });
 });
+
+describe("round 6", () => {
+  it("list tools and summarize take a published maxItems cap that the warning names", async () => {
+    const mk = (n: number) =>
+      ({
+        client: {
+          getAll: async (_p: string, _q: unknown, o: { maxItems: number }) =>
+            Array.from({ length: Math.min(n, o.maxItems) }, (_, i) => ({ id: String(i), voucherDate: "2026-06-01", invoiceDate: "2026-06-01", valueDate: "2026-06-01" })),
+        },
+        config: {},
+      }) as unknown as ToolContext;
+    for (const name of ["sevdesk_list_vouchers", "sevdesk_list_invoices", "sevdesk_list_contacts", "sevdesk_list_transactions"]) {
+      expect((tool(name).inputSchema.properties.maxItems as Row).maximum, name).toBe(20000);
+      const out = (await tool(name).handler({ maxItems: 3 }, mk(10))) as Row;
+      expect(out.truncated, name).toBe(true);
+      expect(String(out.warning), name).toMatch(/first 3 .*Raise maxItems/);
+      expect(String(out.warning)).not.toMatch(/from\/to/);
+      expect(((await tool(name).handler({ maxItems: 99999 }, mk(10))) as Row).truncated).toBe(false);
+    }
+    expect((tool("sevdesk_summarize").inputSchema.properties.maxItems as Row).maximum).toBe(20000);
+    const sum = (await tool("sevdesk_summarize").handler({ kind: "invoices", maxItems: 3 }, mk(10))) as Row;
+    expect(sum.truncated).toBe(true);
+    expect(String(sum.warning)).toMatch(/Raise maxItems/);
+  });
+
+  it("keeps Unicode PDF names from the API", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sevdesk-mcp-uni-"));
+    const c = {
+      client: { request: async () => ({ status: 200, data: { content: Buffer.from("x").toString("base64"), filename: "Rechnung_Müller.pdf" } }) },
+      config: { readOnly: false, dryRun: false, allowedReceiptDirs: [dir] },
+    } as unknown as ToolContext;
+    const out = (await tool("sevdesk_get_invoice_pdf").handler({ invoiceId: 3, directory: dir }, c)) as { saved: string };
+    expect(out.saved).toMatch(/Rechnung_Müller\.pdf$/);
+  });
+
+  it("create_voucher accepts only status 50/100/1000", async () => {
+    const c = { client: {}, config: { readOnly: false, dryRun: true } } as unknown as ToolContext;
+    const a = { supplierName: "A", voucherDate: "01.09.2026", taxRuleId: "9", positions: [{ sumNet: 1, taxRate: 19 }] };
+    for (const bad of ["75", "draft", 1]) {
+      await expect(tool("sevdesk_create_voucher").handler({ ...a, status: bad }, c)).rejects.toThrow(/status must be/);
+    }
+    const out = (await tool("sevdesk_create_voucher").handler({ ...a, status: 100 }, c)) as {
+      wouldSend: { body: { voucher: Row } };
+    };
+    expect(out.wouldSend.body.voucher.status).toBe("100");
+  });
+
+  it("names an unusable allowlist entry instead of calling the target 'outside'", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sevdesk-mcp-bad-"));
+    await writeFile(join(root, "f.pdf"), "x");
+    const missing = join(root, "does-not-exist");
+    const ctx = { config: { allowedReceiptDirs: [missing] } } as unknown as ToolContext;
+    await expect(assertAllowedPath(ctx, join(root, "f.pdf"))).rejects.toThrow(/does-not-exist.*does not exist or is not accessible/);
+  });
+
+  it("refuses non-integer or negative numeric taxRuleIds with a specific message", async () => {
+    const c = { client: {}, config: { readOnly: false, dryRun: true } } as unknown as ToolContext;
+    const v = { supplierName: "A", voucherDate: "01.09.2026", positions: [{ sumNet: 1, taxRate: 19 }] };
+    for (const bad of [12.5, -1]) {
+      await expect(tool("sevdesk_create_voucher").handler({ ...v, taxRuleId: bad }, c)).rejects.toThrow(/whole-number rule id/);
+      await expect(
+        tool("sevdesk_create_invoice").handler({ contactId: 1, taxRuleId: bad, positions: [{ name: "x", price: 1 }] }, c),
+      ).rejects.toThrow(/whole-number rule id/);
+      await expect(tool("sevdesk_set_tax_rule").handler({ voucherId: 1, taxRuleId: bad }, c)).rejects.toThrow(/whole-number rule id/);
+    }
+  });
+
+  it("scrubs content from upload responses whether objects is an object or an array", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sevdesk-mcp-scrub-"));
+    await writeFile(join(dir, "a.pdf"), "x");
+    const run = async (objects: unknown) => {
+      const c = {
+        client: { request: async () => ({ status: 201, data: { objects } }) },
+        config: { readOnly: false, dryRun: false, allowedReceiptDirs: [dir] },
+      } as unknown as ToolContext;
+      return ((await tool("sevdesk_upload_voucher_file").handler({ filePath: join(dir, "a.pdf") }, c)) as { response: { objects: unknown } }).response.objects;
+    };
+    expect(await run({ filename: "h.pdf", content: "BIG" })).toEqual({ filename: "h.pdf" });
+    expect(await run([{ filename: "h.pdf", content: "BIG" }, { filename: "i.pdf" }])).toEqual([{ filename: "h.pdf" }, { filename: "i.pdf" }]);
+    expect(await run("odd")).toBe("odd");
+  });
+
+  it("diff_receipt_folder emits a single truncation message", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sevdesk-mcp-one-"));
+    await writeFile(join(dir, "a.pdf"), "x");
+    const rows = Array.from({ length: 4 }, (_, i) => ({ id: String(i), voucherDate: "2026-06-01", status: "100" }));
+    const c = {
+      client: { getAll: async (_p: string, _q: unknown, o: { maxItems: number }) => rows.slice(0, o.maxItems) },
+      config: { allowedReceiptDirs: [dir] },
+    } as unknown as ToolContext;
+    const out = (await tool("sevdesk_diff_receipt_folder").handler({ directory: dir, maxVouchers: 3 }, c)) as Row;
+    expect(out.truncated).toBe(true);
+    expect(String(out.warning)).toMatch(/vouchersWithoutFile may be incomplete/);
+    expect(String(out.note)).not.toMatch(/Truncated/);
+  });
+});

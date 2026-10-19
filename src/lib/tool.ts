@@ -69,11 +69,19 @@ export async function assertAllowedPath(ctx: ToolContext, filePath: string): Pro
   } catch {
     throw new Error(`Not found: ${resolve(filePath)}`);
   }
-  const roots = (
-    await Promise.all(allow.map((a) => realpath(resolve(a)).catch(() => null)))
-  ).filter((r): r is string => r !== null);
+  const resolved = await Promise.all(
+    allow.map(async (a) => ({ entry: a, real: await realpath(resolve(a)).catch(() => null) })),
+  );
+  const roots = resolved.map((r) => r.real).filter((r): r is string => r !== null);
   const ok = roots.some((r) => target === r || target.startsWith(r.endsWith(sep) ? r : r + sep));
   if (!ok) {
+    const broken = resolved.filter((r) => r.real === null).map((r) => r.entry);
+    if (broken.length) {
+      throw new Error(
+        `Refused: ${target} is not inside any usable SEVDESK_RECEIPT_DIRS entry — ` +
+          `${broken.join(", ")} does not exist or is not accessible.`,
+      );
+    }
     throw new Error(`Refused: ${target} is outside SEVDESK_RECEIPT_DIRS (${allow.join(", ")}).`);
   }
   return target;
@@ -222,7 +230,10 @@ export function optLimit(args: Record<string, unknown>, key: string, fallback: n
 /** A tax rule id given as a string or a whole number (models often send 12 instead of "12"). */
 export function optRuleId(args: Record<string, unknown>, key = "taxRuleId"): string | undefined {
   const v = args[key];
-  if (typeof v === "number" && Number.isSafeInteger(v) && v >= 0) return String(v);
+  if (typeof v === "number") {
+    if (!Number.isSafeInteger(v) || v < 0) throw new Error(`${key} must be a whole-number rule id.`);
+    return String(v);
+  }
   return optString(args, key);
 }
 
@@ -245,7 +256,7 @@ export async function getAllCapped<T = Record<string, unknown>>(
  */
 export function truncationFields(
   truncated: boolean,
-  o: { what: string; cap: number; param?: string },
+  o: { what: string; cap: number; param?: string; detail?: string },
 ): { truncated: boolean; warning?: string } {
   if (!truncated) return { truncated };
   return {
@@ -253,6 +264,7 @@ export function truncationFields(
     warning:
       `Only the first ${o.cap} ${o.what} were fetched, before any filtering, so rows in the ` +
       `requested range may be missing. ` +
-      (o.param ? `Raise ${o.param}.` : "Narrow the request (from/to, filters)."),
+      (o.param ? `Raise ${o.param}.` : "Page through the rest with sevdesk_call (limit/offset).") +
+      (o.detail ? ` ${o.detail}` : ""),
   };
 }

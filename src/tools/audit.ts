@@ -1012,10 +1012,10 @@ const diffReceiptFolder: ToolDef = {
       directory: target,
       filesScanned: files.length,
       vouchersExamined: vouchers.length,
-      ...truncationFields(truncated, voucherCap(maxVouchers)),
-      ...(truncated
-        ? { note: "Truncated: vouchersWithoutFile may be incomplete and files may be wrongly listed as unmatched." }
-        : {}),
+      ...truncationFields(truncated, {
+        ...voucherCap(maxVouchers),
+        detail: "vouchersWithoutFile may be incomplete and files may be wrongly listed as unmatched.",
+      }),
       matched: matchedVoucherIds.size,
       filesWithoutVoucher: { count: unmatchedFiles.length, items: unmatchedFiles },
       vouchersWithoutFile: { count: vouchersWithoutFile.length, items: vouchersWithoutFile },

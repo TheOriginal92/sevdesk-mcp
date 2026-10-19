@@ -108,6 +108,17 @@ Behaviour changes that can break existing callers are marked **(breaking)**.
   `.pdf` names, else `invoice-<id>.pdf`.
 - Release workflow keeps `mcp-publisher` outside the checkout so it cannot end
   up in the MCPB bundle (also listed in `.mcpbignore`).
+- `sevdesk_list_vouchers`, `_invoices`, `_contacts`, `_transactions` and
+  `sevdesk_summarize` take a `maxItems` fetch cap (max 20,000), and their
+  truncation warning names it — the from/to and status filters run after the
+  cap, so narrowing them never reached the missing rows.
+- `sevdesk_create_voucher` accepts only status 50, 100 or 1000 (numbers too).
+- `sevdesk_get_invoice_pdf` keeps Unicode filenames (`Rechnung_Müller.pdf`).
+- A `SEVDESK_RECEIPT_DIRS` entry that does not exist is named in the refusal
+  instead of reporting the target as "outside" the list; a fractional or
+  negative numeric `taxRuleId` gets its own error; the upload response scrub
+  also handles an array `objects`; the receipt-folder diff reports truncation
+  once.
 - Tool output is capped at 200,000 characters, with a closing line saying how
   much was cut.
 

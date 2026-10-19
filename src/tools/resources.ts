@@ -129,6 +129,7 @@ const listVouchers: ToolDef = {
       supplier: str("Case-insensitive substring of the supplier name."),
       status: str("Filter by status.", { enum: ["Entwurf", "offen", "bezahlt"] }),
       limit: int("Maximum rows to return (default 200).", { minimum: 1, maximum: 1000 }),
+      maxItems: int("Fetch cap: how many records are read from sevDesk before filtering (default 2000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
@@ -138,7 +139,8 @@ const listVouchers: ToolDef = {
     const wanted = optString(args, "status");
     const limit = optLimit(args, "limit", 200, 1000);
 
-    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/Voucher", { embed: "supplier,taxRule" }, 2000);
+    const maxItems = optLimit(args, "maxItems", 2000, 20_000);
+    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/Voucher", { embed: "supplier,taxRule" }, maxItems);
 
     const rows = all
       .filter((v) => within(parseSevdeskDate(v.voucherDate), p))
@@ -172,7 +174,7 @@ const listVouchers: ToolDef = {
     return {
       total: rows.length,
       returned: Math.min(rows.length, limit),
-      ...truncationFields(truncated, { what: "vouchers", cap: 2000 }),
+      ...truncationFields(truncated, { what: "vouchers", cap: maxItems, param: "maxItems" }),
       vouchers: rows.slice(0, limit),
     };
   },
@@ -248,13 +250,15 @@ const listInvoices: ToolDef = {
       from: str("Start date."),
       to: str("End date."),
       limit: int("Maximum rows (default 200).", { minimum: 1, maximum: 1000 }),
+      maxItems: int("Fetch cap: how many records are read from sevDesk before filtering (default 2000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
   async handler(args, ctx) {
     const p = period(args);
     const limit = optLimit(args, "limit", 200, 1000);
-    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/Invoice", { embed: "contact,taxRule" }, 2000);
+    const maxItems = optLimit(args, "maxItems", 2000, 20_000);
+    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/Invoice", { embed: "contact,taxRule" }, maxItems);
     const rows = all
       .filter((i) => within(parseSevdeskDate(i.invoiceDate), p))
       .map((i) => {
@@ -274,7 +278,7 @@ const listInvoices: ToolDef = {
         };
       })
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
-    return { total: rows.length, returned: Math.min(rows.length, limit), ...truncationFields(truncated, { what: "invoices", cap: 2000 }), invoices: rows.slice(0, limit) };
+    return { total: rows.length, returned: Math.min(rows.length, limit), ...truncationFields(truncated, { what: "invoices", cap: maxItems, param: "maxItems" }), invoices: rows.slice(0, limit) };
   },
 };
 
@@ -303,6 +307,7 @@ const summarize: ToolDef = {
         "Cap on returned groups; the remainder is folded into one '(andere)' entry (default 40).",
         { minimum: 1, maximum: 1000 },
       ),
+      maxItems: int("Fetch cap: how many records are read from sevDesk before filtering (default 10000).", { minimum: 1, maximum: 20000 }),
     },
     required: ["kind"],
     additionalProperties: false,
@@ -317,7 +322,7 @@ const summarize: ToolDef = {
     const side = optString(args, "side") ?? "any";
     const maxGroups = optLimit(args, "maxGroups", 40, 1000);
 
-    const MAX_ITEMS = 10_000;
+    const MAX_ITEMS = optLimit(args, "maxItems", 10_000, 20_000);
     const { rows, truncated } =
       kind === "invoices"
         ? await getAllCapped<Row>(ctx, "/Invoice", { embed: "contact" }, MAX_ITEMS)
@@ -390,7 +395,7 @@ const summarize: ToolDef = {
       scanned: rows.length,
       matched,
       ...(truncated
-        ? truncationFields(true, { what: kind, cap: MAX_ITEMS })
+        ? truncationFields(true, { what: kind, cap: MAX_ITEMS, param: "maxItems" })
         : {}),
       total: {
         count: total.count,
@@ -419,13 +424,15 @@ const listContacts: ToolDef = {
     properties: {
       search: str("Case-insensitive substring of the contact name."),
       limit: int("Maximum rows (default 200).", { minimum: 1, maximum: 1000 }),
+      maxItems: int("Fetch cap: how many records are read from sevDesk before filtering (default 5000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
   async handler(args, ctx) {
     const search = optString(args, "search")?.toLowerCase();
     const limit = optLimit(args, "limit", 200, 1000);
-    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/Contact", {}, 5000);
+    const maxItems = optLimit(args, "maxItems", 5000, 20_000);
+    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/Contact", {}, maxItems);
     const rows = all
       .map((c) => ({
         id: String(c.id ?? ""),
@@ -435,7 +442,7 @@ const listContacts: ToolDef = {
         taxNumber: c.taxNumber ?? null,
       }))
       .filter((c) => !search || String(c.name).toLowerCase().includes(search));
-    return { total: rows.length, returned: Math.min(rows.length, limit), ...truncationFields(truncated, { what: "contacts", cap: 5000 }), contacts: rows.slice(0, limit) };
+    return { total: rows.length, returned: Math.min(rows.length, limit), ...truncationFields(truncated, { what: "contacts", cap: maxItems, param: "maxItems" }), contacts: rows.slice(0, limit) };
   },
 };
 
@@ -451,6 +458,7 @@ const listTransactions: ToolDef = {
       from: str("Start date."),
       to: str("End date."),
       limit: int("Maximum rows (default 200).", { minimum: 1, maximum: 1000 }),
+      maxItems: int("Fetch cap: how many records are read from sevDesk before filtering (default 5000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
@@ -463,7 +471,8 @@ const listTransactions: ToolDef = {
       query["checkAccount[id]"] = accountId;
       query["checkAccount[objectName]"] = "CheckAccount";
     }
-    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/CheckAccountTransaction", query, 5000);
+    const maxItems = optLimit(args, "maxItems", 5000, 20_000);
+    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/CheckAccountTransaction", query, maxItems);
     const rows = all
       .filter((t) => within(parseSevdeskDate(t.valueDate ?? t.entryDate), p))
       .map((t) => {
@@ -478,7 +487,7 @@ const listTransactions: ToolDef = {
         };
       })
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
-    return { total: rows.length, returned: Math.min(rows.length, limit), ...truncationFields(truncated, { what: "transactions", cap: 5000 }), transactions: rows.slice(0, limit) };
+    return { total: rows.length, returned: Math.min(rows.length, limit), ...truncationFields(truncated, { what: "transactions", cap: maxItems, param: "maxItems" }), transactions: rows.slice(0, limit) };
   },
 };
 
@@ -552,13 +561,16 @@ const uploadVoucherFile: ToolDef = {
     // sevDesk echoes a rendered preview of the upload back in `content` —
     // tens of thousands of base64 characters that are worthless to a caller
     // who needs the filename token. Keep the metadata, drop the blob.
-    const objects = (data as Row | undefined)?.objects as Row | undefined;
-    let response: unknown = data;
-    if (objects && typeof objects === "object") {
-      const meta: Row = { ...objects };
+    const objects = (data as Row | undefined)?.objects;
+    const scrub = (o: unknown): unknown => {
+      if (!o || typeof o !== "object" || Array.isArray(o)) return o;
+      const meta: Row = { ...(o as Row) };
       delete meta.content;
-      response = { objects: meta };
-    }
+      return meta;
+    };
+    let response: unknown = data;
+    if (Array.isArray(objects)) response = { ...(data as Row), objects: objects.map(scrub) };
+    else if (objects && typeof objects === "object") response = { ...(data as Row), objects: scrub(objects) };
     return { uploaded: basename(requested), bytes: info.size, response };
   },
 };
@@ -615,7 +627,11 @@ const createVoucher: ToolDef = {
     const positionsIn = positionObjects(args);
     if (!positionsIn.length) throw new Error("At least one position is required.");
 
-    const status = optString(args, "status") ?? "50";
+    const statusRaw = typeof args.status === "number" ? String(args.status) : optString(args, "status");
+    if (statusRaw !== undefined && !["50", "100", "1000"].includes(statusRaw)) {
+      throw new Error(`status must be 50 (Entwurf), 100 (offen) or 1000 (bezahlt), not '${statusRaw}'.`);
+    }
+    const status = statusRaw ?? "50";
     const cdRaw = optString(args, "creditDebit");
     if (cdRaw !== undefined && cdRaw !== "C" && cdRaw !== "D") {
       throw new Error(`creditDebit must be "C" or "D", not "${cdRaw}".`);
@@ -1087,7 +1103,7 @@ const getInvoicePdf: ToolDef = {
     // The filename comes from the API — keep only its basename so it cannot
     // point outside the allowlisted directory.
     let filename = basename(String(meta?.filename ?? ""));
-    if (!/^[\w.\- ]+\.pdf$/i.test(filename) || filename.startsWith("..")) filename = `invoice-${id}.pdf`;
+    if (!/^[\p{L}\p{N}_.\- ]+\.pdf$/iu.test(filename) || filename.startsWith("..")) filename = `invoice-${id}.pdf`;
     const target = join(dir, filename);
     const bytes = Buffer.from(content, "base64");
     // flag wx: never clobber an existing file in the user's receipt archive.
