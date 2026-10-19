@@ -1,4 +1,4 @@
-import { readdir, stat } from "node:fs/promises";
+import { readdir } from "node:fs/promises";
 import { basename, extname, resolve } from "node:path";
 
 import {
@@ -17,18 +17,20 @@ import {
   ymd,
 } from "../lib/vat.js";
 import {
-  assertAllowedPath,
+  assertAllowedDir,
+  getAllCapped,
+  truncationFields,
   bool,
   int,
   optBool,
-  optNumber,
+  optLimit,
+  optRange,
   optString,
   requireString,
   str,
   type ToolContext,
   type ToolDef,
 } from "../lib/tool.js";
-import { regimeMismatch, type VatRegime } from "../lib/profile.js";
 
 /* ------------------------------------------------------------------ */
 /* shared helpers                                                      */
@@ -36,27 +38,13 @@ import { regimeMismatch, type VatRegime } from "../lib/profile.js";
 
 type Row = Record<string, unknown>;
 
-/**
- * §13b advice differs by regime: with input-tax deduction the reverse charge
- * nets to zero; a Kleinunternehmer cannot deduct, so the VAT is payable.
- * With the regime unknown, both branches are given, labeled.
- */
-function reverseChargeAdvice(regime: VatRegime): string {
-  const ku =
-    "taxRule 13 (§13b ohne Vorsteuerabzug — as Kleinunternehmer you cannot deduct " +
-    "the input tax, so this VAT is actually payable). Domestic 0 % expenses belong " +
-    "on taxRule 10.";
-  const regular =
-    "taxRule 12 (§13b Abs. 2, with input-tax deduction), taxRule 14 (§13b Abs. 1, EU), " +
-    "taxRule 13 (without input-tax deduction) — or taxRule 8 for intra-EU goods.";
-  const advice =
-    regime === "kleinunternehmer"
-      ? ku
-      : regime === "regular"
-        ? regular
-        : `if regular VAT: ${regular} If §19 Kleinunternehmer: ${ku}`;
+/** Neutral on purpose: the account's tax situation is the user's to state, not ours to infer. */
+function reverseChargeAdvice(): string {
   return (
-    `If this is a service from a supplier established abroad, it is Reverse Charge: ${advice} ` +
+    "If this is a service from a supplier established abroad, it is Reverse Charge (§13b): " +
+    "taxRule 12 (§13b Abs. 2, with input-tax deduction), taxRule 14 (§13b Abs. 1, EU, with " +
+    "input-tax deduction) or taxRule 13 (without input-tax deduction — the VAT is then " +
+    "actually payable); intra-EU goods are taxRule 8. " +
     "Otherwise confirm the supplier really invoices without VAT."
   );
 }
@@ -110,11 +98,19 @@ function dayDiff(a: Date | null, b: Date | null): number {
   return a && b ? Math.abs(a.getTime() - b.getTime()) / DAY_MS : Number.POSITIVE_INFINITY;
 }
 
-async function fetchVouchers(ctx: ToolContext, period: PeriodArgs, maxItems: number): Promise<Row[]> {
-  const query: Record<string, unknown> = { embed: "supplier,taxRule" };
-  const all = await ctx.client.getAll<Row>("/Voucher", query, { maxItems });
-  return all.filter((v) => inPeriod(parseSevdeskDate(v.voucherDate), period));
+async function fetchVouchersCapped(
+  ctx: ToolContext,
+  period: PeriodArgs,
+  maxItems: number,
+): Promise<{ vouchers: Row[]; truncated: boolean }> {
+  const { rows, truncated } = await getAllCapped<Row>(ctx, "/Voucher", { embed: "supplier,taxRule" }, maxItems);
+  return {
+    vouchers: rows.filter((v) => inPeriod(parseSevdeskDate(v.voucherDate), period)),
+    truncated,
+  };
 }
+
+const voucherCap = (cap: number) => ({ what: "vouchers", cap, param: "maxVouchers" });
 
 async function fetchPositions(
   ctx: ToolContext,
@@ -126,12 +122,17 @@ async function fetchPositions(
     const id = String(v.id ?? "");
     if (!id) return;
     try {
-      const { data } = await ctx.client.request<{ objects?: Row[] }>({
-        method: "GET",
-        path: "/VoucherPos",
-        query: { "voucher[id]": id, "voucher[objectName]": "Voucher", limit: 200 },
-      });
-      positions.set(id, data?.objects ?? []);
+      // Paged: a voucher can carry more positions than one page returns.
+      const { rows, truncated } = await getAllCapped<Row>(
+        ctx,
+        "/VoucherPos",
+        { "voucher[id]": id, "voucher[objectName]": "Voucher" },
+        5000,
+      );
+      positions.set(id, rows);
+      if (truncated) {
+        warnings.push(`Voucher ${id} has more than 5000 positions; only the first 5000 were checked.`);
+      }
     } catch (err) {
       // A failed fetch must not fail the whole audit, but silently treating it
       // as "no positions" would suppress rate-based findings — say so.
@@ -154,10 +155,11 @@ async function fetchSupplierCountries(
 ): Promise<{ countries: Map<string, string>; warnings: string[] }> {
   const countries = new Map<string, string>();
   try {
-    const contacts = await ctx.client.getAll<Row>(
+    const { rows: contacts, truncated } = await getAllCapped<Row>(
+      ctx,
       "/Contact",
       { depth: 1, embed: "addresses,addresses.country" },
-      { maxItems: 2000 },
+      2000,
     );
     for (const c of contacts) {
       const key = supplierKey(c.name);
@@ -168,7 +170,13 @@ async function fetchSupplierCountries(
         .find(Boolean);
       if (code) countries.set(key, code);
     }
-    return { countries, warnings: [] };
+    const t = truncationFields(truncated, { what: "contacts", cap: 2000 });
+    return {
+      countries,
+      warnings: t.warning
+        ? [`${t.warning} Suppliers beyond that fall back to the supplier-name heuristic for country checks.`]
+        : [],
+    };
   } catch (err) {
     return {
       countries,
@@ -267,46 +275,36 @@ const auditVat: ToolDef = {
       from: str("Start of period, dd.mm.yyyy or yyyy-mm-dd."),
       to: str("End of period, dd.mm.yyyy or yyyy-mm-dd."),
       includePositions: bool("Fetch line items to check rates per position (default true, slower)."),
-      maxVouchers: int("Safety cap on vouchers examined (default 2000)."),
+      maxVouchers: int("Safety cap on vouchers examined (default 2000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
   async handler(args, ctx) {
     const period = readPeriod(args);
     const withPositions = optBool(args, "includePositions") ?? true;
-    const vouchers = await fetchVouchers(ctx, period, optNumber(args, "maxVouchers") ?? 2000);
+    const maxVouchers = optLimit(args, "maxVouchers", 2000, 20_000);
+    const { vouchers, truncated } = await fetchVouchersCapped(ctx, period, maxVouchers);
     const sides = new Set<VoucherSide>(vouchers.map((v) => voucherSide(v) ?? "expense"));
 
     // Positions, contacts and guidance depend only on the voucher list — fetch
     // them concurrently. Without positions there are no rate-based findings,
     // so the contact and guidance lookups are skipped entirely.
     const details = withPositions && vouchers.length > 0;
-    const [posResult, contactResult, guidance, profile] = await Promise.all([
+    const [posResult, contactResult, guidance] = await Promise.all([
       details ? fetchPositions(ctx, vouchers) : { positions: new Map<string, Row[]>(), warnings: [] },
       details ? fetchSupplierCountries(ctx) : { countries: new Map<string, string>(), warnings: [] },
       details ? fetchGuidance(ctx, sides) : { byAccountId: null, warnings: [] },
-      ctx.getProfile(),
     ]);
     const { positions } = posResult;
     const { countries } = contactResult;
     const warnings = [...posResult.warnings, ...contactResult.warnings, ...guidance.warnings];
+    {
+      const t = truncationFields(truncated, voucherCap(maxVouchers));
+      if (t.warning) warnings.push(t.warning);
+    }
 
     const findings: Finding[] = [];
 
-    // Configuration that contradicts the ledger is itself an audit finding —
-    // every regime-dependent suggestion below inherits its bias.
-    const mismatch = regimeMismatch(profile);
-    if (mismatch) {
-      findings.push({
-        severity: "high",
-        code: "vat_regime_mismatch",
-        voucherId: "",
-        voucher: "account configuration",
-        detail: mismatch,
-        suggestion:
-          "Resolve the contradiction before trusting regime-dependent suggestions in this audit.",
-      });
-    }
     const bySupplier = new Map<string, { rules: Set<string>; names: Set<string> }>();
 
     for (const v of vouchers) {
@@ -385,8 +383,8 @@ const auditVat: ToolDef = {
                 ? `, and the supplier's contact is registered in "${cls.country}".`
                 : `, and the supplier name looks non-German.`
               : cls.verdict === "domestic"
-                ? `, but the supplier's contact is registered in Germany — a §19 (Kleinunternehmer) ` +
-                  `supplier would make this booking correct.`
+                ? `, but the supplier's contact is registered in Germany — a supplier that ` +
+                  `charges no VAT (e.g. §19 UStG) would make this booking correct.`
                 : `.`;
           findings.push({
             severity:
@@ -395,7 +393,7 @@ const auditVat: ToolDef = {
             voucherId: id,
             voucher: label,
             detail: `Booked as ${bookedAs} but every position carries 0 % VAT` + hint,
-            suggestion: reverseChargeAdvice(profile.regime),
+            suggestion: reverseChargeAdvice(),
           });
         } else if (side === "revenue" && effectiveRule === "1") {
           findings.push({
@@ -535,6 +533,7 @@ const auditVat: ToolDef = {
       period: periodLabel(period),
       vouchersExamined: vouchers.length,
       positionsFetched: withPositions,
+      truncated,
       warnings,
       findingCount: findings.length,
       byCode: counts,
@@ -578,19 +577,23 @@ const reverseChargeReport: ToolDef = {
     properties: {
       from: str("Start of period, dd.mm.yyyy or yyyy-mm-dd."),
       to: str("End of period, dd.mm.yyyy or yyyy-mm-dd."),
-      rate: { type: "number", description: "VAT rate to apply to the base (default 19)." },
-      maxVouchers: int("Safety cap (default 2000)."),
+      rate: { type: "number", description: "VAT rate in percent to apply to the base (default 19, 0-100).", minimum: 0, maximum: 100 },
+      maxVouchers: int("Safety cap (default 2000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
   async handler(args, ctx) {
     const period = readPeriod(args);
-    const rate = optNumber(args, "rate") ?? 19;
-    const [vouchers, { countries, warnings }, profile] = await Promise.all([
-      fetchVouchers(ctx, period, optNumber(args, "maxVouchers") ?? 2000),
+    const rate = optRange(args, "rate", 19, 0, 100);
+    const maxVouchers = optLimit(args, "maxVouchers", 2000, 20_000);
+    const [{ vouchers, truncated }, { countries, warnings }] = await Promise.all([
+      fetchVouchersCapped(ctx, period, maxVouchers),
       fetchSupplierCountries(ctx),
-      ctx.getProfile(),
     ]);
+    {
+      const t = truncationFields(truncated, voucherCap(maxVouchers));
+      if (t.warning) warnings.push(t.warning);
+    }
 
     const deductible: Row[] = [];
     const nonDeductible: Row[] = [];
@@ -629,6 +632,7 @@ const reverseChargeReport: ToolDef = {
     return {
       period: periodLabel(period),
       rateApplied: rate,
+      truncated,
       warnings,
       reverseChargeExpenses: {
         deductible: {
@@ -670,13 +674,8 @@ const reverseChargeReport: ToolDef = {
         wouldAddVat: round2((suspectedBase * rate) / 100),
         note:
           "These are booked as plain expenses with 0 % VAT and have a foreign-looking supplier. " +
-          (profile.regime === "kleinunternehmer"
-            ? "As Kleinunternehmer the correct rule is 13 (§13b ohne Vorsteuerabzug) — that VAT " +
-              "would actually be payable. "
-            : profile.regime === "unknown"
-              ? "If the account is a §19 Kleinunternehmer, the correct rule is 13 (ohne " +
-                "Vorsteuerabzug — VAT payable); under regular VAT, rules 12/14 net to zero. "
-              : "") +
+          "Reverse Charge needs taxRule 12/14 (input-tax deduction) or 13 (without — the VAT is " +
+          "then payable). " +
           "Verify each one — the heuristic reads company suffixes, it does not know where a " +
           "supplier is established.",
         vouchers: suspected,
@@ -701,15 +700,16 @@ const findDuplicates: ToolDef = {
     properties: {
       from: str("Start of period, dd.mm.yyyy or yyyy-mm-dd."),
       to: str("End of period, dd.mm.yyyy or yyyy-mm-dd."),
-      dayWindow: int("How many days apart two same-amount vouchers may be to count as duplicates (default 7)."),
-      maxVouchers: int("Safety cap (default 2000)."),
+      dayWindow: int("How many days apart two same-amount vouchers may be to count as duplicates (default 7, 0-366).", { minimum: 0, maximum: 366 }),
+      maxVouchers: int("Safety cap (default 2000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
   async handler(args, ctx) {
     const period = readPeriod(args);
-    const dayWindow = optNumber(args, "dayWindow") ?? 7;
-    const vouchers = await fetchVouchers(ctx, period, optNumber(args, "maxVouchers") ?? 2000);
+    const dayWindow = optRange(args, "dayWindow", 7, 0, 366, true);
+    const maxVouchers = optLimit(args, "maxVouchers", 2000, 20_000);
+    const { vouchers, truncated } = await fetchVouchersCapped(ctx, period, maxVouchers);
 
     const byNumber = new Map<string, Row[]>();
     for (const v of vouchers) {
@@ -768,6 +768,7 @@ const findDuplicates: ToolDef = {
 
     return {
       vouchersExamined: vouchers.length,
+      ...truncationFields(truncated, voucherCap(maxVouchers)),
       duplicateDocumentNumbers: sameNumber,
       sameSupplierSameAmount: sameAmount,
       notYetBooked: unfinished,
@@ -795,15 +796,16 @@ const subscriptionGaps: ToolDef = {
     properties: {
       from: str("Start of period, dd.mm.yyyy or yyyy-mm-dd."),
       to: str("End of period, dd.mm.yyyy or yyyy-mm-dd."),
-      minMonths: int("How many distinct months a supplier needs before it counts as recurring (default 3)."),
-      maxVouchers: int("Safety cap (default 2000)."),
+      minMonths: int("How many distinct months a supplier needs before it counts as recurring (default 3, 1-120).", { minimum: 1, maximum: 120 }),
+      maxVouchers: int("Safety cap (default 2000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
   async handler(args, ctx) {
     const period = readPeriod(args);
-    const minMonths = optNumber(args, "minMonths") ?? 3;
-    const vouchers = await fetchVouchers(ctx, period, optNumber(args, "maxVouchers") ?? 2000);
+    const minMonths = optRange(args, "minMonths", 3, 1, 120, true);
+    const maxVouchers = optLimit(args, "maxVouchers", 2000, 20_000);
+    const { vouchers, truncated } = await fetchVouchersCapped(ctx, period, maxVouchers);
 
     const bySupplier = new Map<string, { name: string; months: Map<string, number> }>();
     for (const v of vouchers) {
@@ -853,6 +855,7 @@ const subscriptionGaps: ToolDef = {
     return {
       period: periodLabel(period),
       monthsCovered: allMonths,
+      ...truncationFields(truncated, voucherCap(maxVouchers)),
       recurringSuppliersWithGaps: results.length,
       estimatedTotalMissing: round2(results.reduce((s, r) => s + num(r.estimatedMissingValue), 0)),
       results,
@@ -916,7 +919,8 @@ const diffReceiptFolder: ToolDef = {
       recursive: bool("Descend into subdirectories (default false)."),
       from: str("Only consider vouchers from this date on."),
       to: str("Only consider vouchers up to this date."),
-      dayTolerance: int("Days a file date may differ from the voucher date (default 5)."),
+      dayTolerance: int("Days a file date may differ from the voucher date (default 5, 0-366).", { minimum: 0, maximum: 366 }),
+      maxVouchers: int("Safety cap on vouchers examined (default 2000); the output flags when it was hit.", { minimum: 1, maximum: 20000 }),
       extensions: {
         type: "array",
         items: { type: "string" },
@@ -927,14 +931,16 @@ const diffReceiptFolder: ToolDef = {
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const target = assertAllowedPath(ctx, requireString(args, "directory"));
+    const target = await assertAllowedDir(ctx, requireString(args, "directory"));
 
-    const info = await stat(target).catch(() => null);
-    if (!info?.isDirectory()) throw new Error(`Not a directory: ${target}`);
-
-    const exts = (Array.isArray(args.extensions) ? (args.extensions as string[]) : [".pdf"]).map((e) =>
-      e.startsWith(".") ? e.toLowerCase() : `.${e.toLowerCase()}`,
-    );
+    const rawExts: unknown[] = Array.isArray(args.extensions) ? args.extensions : [".pdf"];
+    if (!rawExts.every((e): e is string => typeof e === "string" && e.trim() !== "")) {
+      throw new Error("extensions must be a list of non-empty strings, e.g. ['.pdf'].");
+    }
+    const exts = rawExts.map((e) => {
+      const x = (e as string).trim().toLowerCase();
+      return x.startsWith(".") ? x : `.${x}`;
+    });
     const recursive = optBool(args, "recursive") ?? false;
 
     const files: string[] = [];
@@ -954,8 +960,10 @@ const diffReceiptFolder: ToolDef = {
 
     const parsed = files.map((f) => parseReceiptFilename(f));
     const period = readPeriod(args);
-    const tolerance = (optNumber(args, "dayTolerance") ?? 5) * DAY_MS;
-    const vouchers = await fetchVouchers(ctx, period, 2000);
+    const tolerance = optRange(args, "dayTolerance", 5, 0, 366, true) * DAY_MS;
+    const maxVouchers = optLimit(args, "maxVouchers", 2000, 20_000);
+    // A hidden voucher would be reported below as "has no file".
+    const { vouchers, truncated } = await fetchVouchersCapped(ctx, period, maxVouchers);
 
     const matchedVoucherIds = new Set<string>();
     const unmatchedFiles: Row[] = [];
@@ -1004,6 +1012,10 @@ const diffReceiptFolder: ToolDef = {
       directory: target,
       filesScanned: files.length,
       vouchersExamined: vouchers.length,
+      ...truncationFields(truncated, {
+        ...voucherCap(maxVouchers),
+        detail: "vouchersWithoutFile may be incomplete and files may be wrongly listed as unmatched.",
+      }),
       matched: matchedVoucherIds.size,
       filesWithoutVoucher: { count: unmatchedFiles.length, items: unmatchedFiles },
       vouchersWithoutFile: { count: vouchersWithoutFile.length, items: vouchersWithoutFile },
@@ -1038,20 +1050,25 @@ const reconcileTransactions: ToolDef = {
     properties: {
       from: str("Start of period, dd.mm.yyyy or yyyy-mm-dd."),
       to: str("End of period, dd.mm.yyyy or yyyy-mm-dd."),
-      dayWindow: int("Maximum days between payment and voucher date to still count as a match (default 5)."),
-      maxItems: int("Safety cap per side (default 2000)."),
+      dayWindow: int("Maximum days between payment and voucher date to still count as a match (default 5, 0-366).", { minimum: 0, maximum: 366 }),
+      maxItems: int("Safety cap per side (default 2000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
   async handler(args, ctx) {
     const period = readPeriod(args);
-    const window = optNumber(args, "dayWindow") ?? 5;
-    const maxItems = optNumber(args, "maxItems") ?? 2000;
+    const window = optRange(args, "dayWindow", 5, 0, 366, true);
+    const maxItems = optLimit(args, "maxItems", 2000, 20_000);
 
-    const [transactions, vouchers] = await Promise.all([
-      ctx.client.getAll<Row>("/CheckAccountTransaction", {}, { maxItems }),
-      fetchVouchers(ctx, period, maxItems),
-    ]);
+    const [{ rows: transactions, truncated: txTruncated }, { vouchers, truncated: vouchersTruncated }] =
+      await Promise.all([
+        getAllCapped<Row>(ctx, "/CheckAccountTransaction", {}, maxItems),
+        fetchVouchersCapped(ctx, period, maxItems),
+      ]);
+    const cutWarnings = [
+      truncationFields(vouchersTruncated, { what: "vouchers", cap: maxItems, param: "maxItems" }).warning,
+      truncationFields(txTruncated, { what: "transactions", cap: maxItems, param: "maxItems" }).warning,
+    ].filter(Boolean);
     const txs = transactions.filter((t) => inPeriod(parseSevdeskDate(t.valueDate), period));
 
     const candidates = vouchers.map((v) => ({
@@ -1100,6 +1117,8 @@ const reconcileTransactions: ToolDef = {
       period: periodLabel(period),
       transactionsExamined: txs.length,
       vouchersExamined: vouchers.length,
+      truncated: cutWarnings.length > 0,
+      ...(cutWarnings.length ? { warning: cutWarnings.join(" ") } : {}),
       matched,
       unmatchedTransactions,
       vouchersWithoutPayment,
@@ -1139,17 +1158,14 @@ const invoiceAging: ToolDef = {
     properties: {
       from: str("Start of period (invoice date), dd.mm.yyyy or yyyy-mm-dd."),
       to: str("End of period, dd.mm.yyyy or yyyy-mm-dd."),
-      maxItems: int("Safety cap (default 2000)."),
+      maxItems: int("Safety cap (default 2000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
   async handler(args, ctx) {
     const period = readPeriod(args);
-    const all = await ctx.client.getAll<Row>(
-      "/Invoice",
-      { embed: "contact" },
-      { maxItems: optNumber(args, "maxItems") ?? 2000 },
-    );
+    const maxItems = optLimit(args, "maxItems", 2000, 20_000);
+    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/Invoice", { embed: "contact" }, maxItems);
     const invoices = all.filter((i) => inPeriod(parseSevdeskDate(i.invoiceDate), period));
     const now = new Date();
 
@@ -1220,6 +1236,7 @@ const invoiceAging: ToolDef = {
     return {
       period: periodLabel(period),
       invoicesExamined: invoices.length,
+      ...truncationFields(truncated, { what: "invoices", cap: maxItems, param: "maxItems" }),
       outstandingTotal,
       aging,
       drafts,

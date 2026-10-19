@@ -1,6 +1,138 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 — 2026-10-19
+
+**Breaking**
+
+- `SEVDESK_KLEINUNTERNEHMER` (0.4.0) is no longer read — a startup notice
+  is printed if it is still set. The server no longer applies
+  Kleinunternehmer-aware defaults to invoices or audit suggestions, so
+  reverse-charge advice is the same for every account.
+- `taxRuleId` is required on `sevdesk_create_invoice` and
+  `sevdesk_create_voucher`; the server does not guess a tax treatment.
+  `sevdesk_create_voucher` also refuses a rule from the wrong side (an
+  expense rule needs `creditDebit` C, a revenue rule D).
+- `sevdesk_set_tax_rule` now enforces its documented draft-only scope: open
+  and paid vouchers are refused before anything is sent (dry runs included)
+  instead of relying on the API to reject the update. Found in a live
+  read-only/dry-run check, where a paid voucher still got a preview.
+
+**Security / hardening**
+
+Behaviour changes that can break existing callers are marked **(breaking)**.
+
+- **(breaking)** `SEVDESK_BASE_URL` must be `https://`; `http://` is accepted
+  only for `localhost`, `127.0.0.1` and `[::1]`. The server refuses to start
+  otherwise — the token is sent as a header.
+- **(breaking)** `SEVDESK_RECEIPT_DIRS` is split on the platform path
+  delimiter (`;` on Windows, so `C:\…` works) and relative entries are
+  refused at startup.
+- Redirects are no longer followed (`redirect: "manual"`); a 3xx becomes a
+  non-retried `SevdeskApiError`, since following it would replay a write to
+  an unconfigured URL.
+- A GET/HEAD with a body is refused up front instead of being retried as a
+  network error; `sevdesk_call` also refuses a `body` on GET operations.
+- **(breaking)** Ids (`voucherId`, `invoiceId`, `contactId`, `checkAccountId`,
+  position `accountingTypeId`) must be numeric (number or digit string), and
+  `sevdesk_call` requires numeric path parameters. `.` and `..` are refused
+  as path parameters.
+- `limit`, `maxVouchers`, `maxItems`, `maxGroups` are floored and clamped to
+  `[1, max]` (list limits 1000, `sevdesk_list_operations` 200,
+  `maxVouchers`/`maxItems` 20,000); the schemas now publish the `maximum`.
+  `sevdesk_list_invoices`, `_contacts` and `_transactions` also report `returned`. A negative
+  or huge value no longer slices off the wrong rows or walks the whole ledger.
+- The receipt allowlist resolves symlinks on both sides and returns the real
+  path; the target must exist.
+- `sevdesk_call` is annotated `destructiveHint: true` (new `ToolDef.destructive`);
+  all other tools stay `false`.
+- **(breaking)** `sevdesk_call` classifies state-changing GETs as writes:
+  `sendByWithRender` (`sendCreditNoteByPrinting`) and a truthy `enshrine*`
+  flag (`exportDatevCSV` `enshrineDocuments`, `exportDatevDepricated`
+  `enshrine`) are refused under `SEVDESK_READ_ONLY=true`, only previewed
+  under `dryRun`, and sent as mutating requests. `body: null` / `{}` on a
+  GET is ignored.
+- `sevdesk_call` defaults `preventSendBy` (absent or null) to true on `invoiceGetPdf`,
+  `creditNoteGetPdf` and `orderGetPdf` (derived from the catalog), and refuses
+  `preventSendBy=false` under `SEVDESK_READ_ONLY=true` (elsewhere it counts as a
+  write for `dryRun`); truthy strings are sent as a literal `true`.
+- **(breaking)** `sevdesk_create_voucher` requires a numeric `taxRate` and
+  exactly one of `sumNet` / `sumGross` per position, checks the rate against
+  the tax rule's allowed rates, and refuses `extra` keys that collide with
+  fields the tool sets (`status`, `taxRule`, `creditDebit`, `voucherDate`,
+  `supplierName`, `objectName`, `mapAll`, `voucherType`, `taxType`, `taxSet`,
+  and `description` / `payDate` when given). Positions must be all net or all
+  gross, and `creditDebit` must be `C` or `D` (anything else used to become `C`).
+- **(breaking)** `sevdesk_create_invoice` requires a finite numeric `price` and
+  a non-empty position `name`.
+- **(breaking)** `sevdesk_upload_voucher_file` maps `.xml` (XRechnung /
+  ZUGFeRD) to `application/xml` and `.jpg`/`.jpeg` to `image/jpeg`; other
+  extensions are refused unless `mimeType` is passed (it used to guess JPEG).
+- **(breaking)** `SEVDESK_BASE_URL` with a query string, fragment or
+  credentials is refused at startup.
+- Audit numeric arguments are clamped and their schemas publish the range:
+  `dayWindow` / `dayTolerance` 0-366, `minMonths` 1-120, `rate` 0-100. A
+  negative value no longer silently yields "no match". `extensions` entries
+  must be strings.
+- `sevdesk_diff_receipt_folder` takes `maxVouchers` (default 2000, max 20,000)
+  and reports `truncated` plus a warning when the cap was hit, instead of
+  listing the unfetched vouchers as missing their file.
+- `sevdesk_call`: a write keeps `body: {}` as sent; on a GET `null`, `{}` and
+  `[]` count as no body. `extra` and each `positions` entry must be objects.
+  `sevdesk_get_invoice_pdf` checks the target directory before fetching.
+- Every audit that fetches vouchers (and `sevdesk_reconcile_transactions` for
+  transactions) reports `truncated` and a warning when `maxVouchers` /
+  `maxItems` cut the ledger before the date filter; an exact fit is not flagged.
+- `sevdesk_create_voucher` refuses `fileName`/`filename` in `extra`;
+  `taxRuleId` may be given as a number. `sevdesk_get_invoice_pdf` falls back to
+  `invoice-<id>.pdf` for an empty or dot-only API filename. The base URL is
+  rebuilt from the parsed URL (a bare `?`/`#` is dropped).
+- Release workflow verifies the pinned `mcp-publisher` checksum before `npm publish`.
+- **(breaking)** `SEVDESK_READ_ONLY`, `SEVDESK_DRY_RUN` and `SEVDESK_DEBUG`
+  accept `1/true/yes/on` and `0/false/no/off` (trimmed, any case; empty = default)
+  and **refuse to start** on anything else, instead of silently reading it as
+  false. `SEVDESK_MAX_RETRIES=0` now means no retries (it used to fall back to
+  3); invalid numbers in `SEVDESK_MAX_RETRIES`, `SEVDESK_TIMEOUT_MS` and
+  `SEVDESK_RATE_LIMIT` also fail at startup.
+- **(breaking)** An unparseable per-call `dryRun` (e.g. `"dry"`, `2`) is refused
+  with "dryRun must be true or false." instead of becoming a real write;
+  `1`, `0` and `" TRUE "` are understood. `sevdesk_call` likewise refuses
+  unparseable `preventSendBy` / `enshrine*` values and sends literal booleans.
+- **(breaking)** `sevdesk_upload_voucher_file` again refuses relative paths
+  (the check now runs before the path is resolved).
+- `sevdesk_create_invoice` validates explicit position rates against the tax
+  rule (rule 11 with 19 % is refused). The invoice-level rate and text follow
+  the positions when they agree (`Umsatzsteuer 7%`); when they differ the rule
+  default rate stays and the text is the rule label, since no single
+  percentage would be true.
+- The `sevdesk_list_*` tools, `sevdesk_summarize`, invoice aging and the contact
+  lookup behind the reverse-charge checks report `truncated` plus a warning
+  naming the right noun and the argument to raise. Voucher positions are
+  paged instead of cut at 200.
+- `sevdesk_get_invoice_pdf` only keeps API filenames that look like plain
+  `.pdf` names, else `invoice-<id>.pdf`.
+- Release workflow keeps `mcp-publisher` outside the checkout so it cannot end
+  up in the MCPB bundle (also listed in `.mcpbignore`).
+- `sevdesk_list_vouchers`, `_invoices`, `_contacts`, `_transactions` and
+  `sevdesk_summarize` take a `maxItems` fetch cap (max 20,000), and their
+  truncation warning names it — the from/to and status filters run after the
+  cap, so narrowing them never reached the missing rows.
+- `sevdesk_create_voucher` accepts only status 50, 100 or 1000 (numbers too).
+- `sevdesk_get_invoice_pdf` keeps Unicode filenames (`Rechnung_Müller.pdf`).
+- A `SEVDESK_RECEIPT_DIRS` entry that does not exist is named in the refusal
+  instead of reporting the target as "outside" the list; a fractional or
+  negative numeric `taxRuleId` gets its own error; the upload response scrub
+  also handles an array `objects`; the receipt-folder diff reports truncation
+  once.
+- Tool output is capped at 200,000 characters, with a closing line saying how
+  much was cut.
+
+**Fixed** (thanks @TheOriginal92, PR #2)
+
+- `sevdesk_create_voucher` attaches the uploaded receipt via the
+  top-level `filename` of `saveVoucher`, where sevDesk reads it.
+- `sevdesk_upload_voucher_file` no longer returns sevDesk's base64
+  preview in its result.
+- `sevdesk_create_voucher` accepts the expense-side tax rules.
 
 - Optional `.env` support for runs outside an MCP client: a `.env` beside
   `package.json` is read at startup, so `npm run dev` and
@@ -33,18 +165,7 @@
 - `SEVDESK_DEBUG=true` logs method/path/status to stderr — never query
   strings, bodies or the token.
 
-- Generalized VAT-regime handling: `SEVDESK_VAT_REGIME`
-  (`regular` / `kleinunternehmer` / `auto`, default `auto`) replaces the
-  Kleinunternehmer boolean. `auto` infers the regime from the newest
-  invoices (taxRule 11 / `smallSettlement` / §19 taxText — works on both
-  bookkeeping generations); `sevdesk_ping` reports the verdict with
-  evidence. `SEVDESK_KLEINUNTERNEHMER` stays honored, marked deprecated.
-- Hardened against misconfiguration: an explicit regime that contradicts
-  the ledger becomes a `vat_regime_mismatch` audit finding (config still
-  wins — loudly). With the regime unknown, `sevdesk_create_invoice`
-  refuses to guess a tax rule instead of silently defaulting; audit
-  suggestions carry both labeled branches.
-- Invoice tax defaults now follow the chosen *rule*, not the regime: 0 %
+- Invoice tax defaults follow the chosen *rule*: 0 %
   rules (Ausfuhr, §4, §13b …) no longer get a silent 19 % default, and
   OSS rules require explicit per-position rates.
 - Server `instructions` (MCP-native usage guidance for every client) and

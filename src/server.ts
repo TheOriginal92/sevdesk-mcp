@@ -5,7 +5,23 @@ import { auditTools } from "./tools/audit.js";
 import { discoveryTools } from "./tools/discovery.js";
 import { resourceTools } from "./tools/resources.js";
 
-export const VERSION = "0.4.0";
+/** Longest tool result passed to the model; a list endpoint can return megabytes. */
+export const MAX_OUTPUT_CHARS = 200_000;
+
+export function capOutput(text: string): string {
+  if (text.length <= MAX_OUTPUT_CHARS) return text;
+  // Do not cut between the halves of a surrogate pair (emoji etc.).
+  let cut = MAX_OUTPUT_CHARS;
+  const unit = text.charCodeAt(cut - 1);
+  if (unit >= 0xd800 && unit <= 0xdbff) cut--;
+  return (
+    text.slice(0, cut) +
+    `\n\n[Output truncated at ${cut} of ${text.length} characters. ` +
+    "Narrow the request: a smaller limit/offset, a date range or filters.]"
+  );
+}
+
+export const VERSION = "0.5.0";
 
 /** Every tool the server exposes, in listing order. */
 export const tools: ToolDef[] = [...resourceTools, ...auditTools, ...discoveryTools];
@@ -24,10 +40,11 @@ export function buildServer(ctx: ToolContext): Server {
       capabilities: { tools: {} },
       instructions:
         `sevDesk accounting (German SMB bookkeeping) for AI agents. ` +
-        `Mode: ${ctx.config.readOnly ? "READ-ONLY — write tools are hidden" : ctx.config.dryRun ? "DRY-RUN — writes preview instead of sending" : "read/write — writes create drafts only"}. ` +
+        `Mode: ${ctx.config.readOnly ? "READ-ONLY — write tools are hidden" : ctx.config.dryRun ? "DRY-RUN — writes preview instead of sending" : "read/write — writes default to drafts"}. ` +
         `Start with sevdesk_ping: it verifies the token and reports the account's ` +
-        `bookkeeping generation and detected VAT regime (regular vs §19 Kleinunternehmer) ` +
-        `with evidence — tax defaults and audit advice follow that regime. ` +
+        `bookkeeping generation. Tax rules are never guessed: write tools that need one ` +
+        `take taxRuleId explicitly, and sevdesk_receipt_guidance lists what each booking ` +
+        `account allows. ` +
         `Prefer the curated sevdesk_* tools; for anything else use sevdesk_call after ` +
         `sevdesk_list_operations / sevdesk_describe_operation. Every write accepts ` +
         `dryRun:true for a preview. Dates are yyyy-mm-dd; amounts EUR unless stated.`,
@@ -52,11 +69,12 @@ export function buildServer(ctx: ToolContext): Server {
             ? " ⚠️ This tool can change data in sevDesk."
             : ""),
         inputSchema: t.inputSchema,
-        // Standard MCP hints so clients can shape confirmation UX. Writes are
-        // never destructive here: they create drafts or flip reversible flags.
+        // Standard MCP hints so clients can shape confirmation UX. The curated
+        // writes create drafts or flip reversible flags; only tools that can
+        // delete (sevdesk_call) declare themselves destructive.
         annotations: {
           readOnlyHint: !t.mutating,
-          destructiveHint: false,
+          destructiveHint: t.destructive === true,
           openWorldHint: true,
         },
       })),
@@ -89,8 +107,9 @@ export function buildServer(ctx: ToolContext): Server {
 
     try {
       const result = await tool.handler((rawArgs ?? {}) as Record<string, unknown>, ctx);
-      const text =
-        typeof result === "string" ? result : JSON.stringify(result, null, 2);
+      const text = capOutput(
+        typeof result === "string" ? result : (JSON.stringify(result, null, 2) ?? ""),
+      );
       return { content: [{ type: "text" as const, text }] };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

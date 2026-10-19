@@ -7,7 +7,7 @@ import {
 } from "../catalog.js";
 import { SevdeskClient } from "../client.js";
 import { ReadOnlyError } from "../config.js";
-import { bool, isDryRun, obj, optNumber, optString, requireString, str, type ToolDef } from "../lib/tool.js";
+import { bool, isDryRun, obj, optLimit, optString, requireString, str, strictBool, type ToolDef } from "../lib/tool.js";
 
 /**
  * Three tools that together expose the *entire* sevDesk API.
@@ -46,7 +46,7 @@ const listOperations: ToolDef = {
       query: optString(args, "query"),
       tag: optString(args, "tag"),
       kind,
-      limit: optNumber(args, "limit") ?? 60,
+      limit: optLimit(args, "limit", 60, 200),
     });
     if (ops.length === 0) {
       return {
@@ -97,8 +97,12 @@ const callOperation: ToolDef = {
     "by name; remaining `params` entries become query parameters. Nested objects are " +
     "encoded in sevDesk's bracket syntax (a[b]=c). Mutating operations are refused when " +
     "the server runs with SEVDESK_READ_ONLY=true, and are only described (not sent) when " +
-    "SEVDESK_DRY_RUN=true or `dryRun` is passed.",
-  mutating: true, // conservatively declared; the handler checks per operation
+    "SEVDESK_DRY_RUN=true or `dryRun` is passed. Operations with a `preventSendBy` query " +
+    "parameter (the *GetPdf reads) default it to true so a read does not mark the document as sent. " +
+    "GETs that change state (sendByWithRender, enshrine flags, preventSendBy=false) count as writes. " +
+    "Can call DELETE operations, which are irreversible.",
+  mutating: true,
+  destructive: true, // conservatively declared; the handler checks per operation
   listInReadOnly: true, // covers reads too — writes are refused per call below
   inputSchema: {
     type: "object",
@@ -122,7 +126,14 @@ const callOperation: ToolDef = {
     }
 
     const params = (args.params ?? {}) as Record<string, unknown>;
-    const body = args.body;
+    // null / {} carry nothing; treat them as "no body" so a harmless filler
+    // value does not fail a GET.
+    // Only on GETs: a write keeps its body verbatim (`{}` is a meaningful payload).
+    const emptyBody =
+      !op.mutating &&
+      (args.body === null ||
+        (typeof args.body === "object" && Object.keys(args.body as object).length === 0));
+    const body = emptyBody ? undefined : args.body;
 
     if (op.mutating && ctx.config.readOnly) throw new ReadOnlyError(op.operationId);
 
@@ -139,13 +150,52 @@ const callOperation: ToolDef = {
       );
     }
 
+    // Every path parameter in the sevDesk spec is an id. Anything but digits
+    // could retarget the request ("..", "1/../x", "1?x").
+    for (const p of op.params) {
+      if (p.in !== "path") continue;
+      const v = params[p.name];
+      if (!(typeof v === "number" ? Number.isSafeInteger(v) && v >= 0 : /^\d+$/.test(String(v)))) {
+        throw new Error(`Refused: path parameter '${p.name}' of ${op.operationId} must be a numeric id.`);
+      }
+    }
+
+    if (body !== undefined && !op.mutating) {
+      throw new Error(`Refused: ${op.operationId} is a ${op.method} operation and takes no request body.`);
+    }
+
     const filledPath = SevdeskClient.fillPath(op.path, params);
     const query: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(params)) {
       if (!pathParamNames.has(k)) query[k] = v;
     }
 
-    if (isDryRun(args, ctx) && op.mutating) {
+    // Some GETs change state, and the catalog calls every GET a read. Without
+    // this, SEVDESK_READ_ONLY and dryRun would let them through:
+    //  - *GetPdf marks the document as sent unless preventSendBy is true, so
+    //    default it on (absent or null) and send a literal true;
+    //  - sendByWithRender sends/marks a document;
+    //  - enshrine* flags (Festschreibung) are irreversible when truthy. Only
+    //    flags that start with "enshrine" count: includeEnshrined and
+    //    withEnshrinedDocuments are read filters.
+    let effectiveMutating = op.mutating;
+    if (op.params.some((p) => p.in === "query" && p.name === "preventSendBy")) {
+      // Normalized to a literal boolean; an unparseable value is refused, not forwarded.
+      const flag = strictBool(query, "preventSendBy") ?? true;
+      query.preventSendBy = flag;
+      if (!flag) effectiveMutating = true; // explicitly turned off: the document gets marked as sent
+    }
+    if (op.path.endsWith("/sendByWithRender")) effectiveMutating = true;
+    for (const p of op.params) {
+      if (p.in !== "query" || !/^enshrine/i.test(p.name)) continue;
+      const flag = strictBool(params, p.name);
+      if (flag === undefined) continue;
+      query[p.name] = flag;
+      if (flag) effectiveMutating = true;
+    }
+    if (effectiveMutating && ctx.config.readOnly) throw new ReadOnlyError(op.operationId);
+
+    if (isDryRun(args, ctx) && effectiveMutating) {
       return {
         dryRun: true,
         wouldSend: {
@@ -163,7 +213,7 @@ const callOperation: ToolDef = {
       path: filledPath,
       query: Object.keys(query).length ? query : undefined,
       body,
-      mutating: op.mutating,
+      mutating: effectiveMutating,
     });
     return { status: result.status, data: result.data };
   },

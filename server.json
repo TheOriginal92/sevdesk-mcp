@@ -6,13 +6,13 @@
     "url": "https://github.com/joosthel/sevdesk-mcp",
     "source": "github"
   },
-  "version": "0.4.0",
+  "version": "0.5.0",
   "packages": [
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
       "identifier": "sevdesk-mcp",
-      "version": "0.4.0",
+      "version": "0.5.0",
       "transport": { "type": "stdio" },
       "environmentVariables": [
         {
@@ -27,12 +27,6 @@
           "description": "Start in read-only mode (recommended: true)",
           "isRequired": false,
           "format": "boolean"
-        },
-        {
-          "name": "SEVDESK_VAT_REGIME",
-          "description": "VAT regime: regular, kleinunternehmer (§19 UStG) or auto (default: infer from recent invoices)",
-          "isRequired": false,
-          "format": "string"
         },
         {
           "name": "SEVDESK_RATE_LIMIT",

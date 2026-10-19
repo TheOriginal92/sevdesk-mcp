@@ -1,3 +1,5 @@
+import { delimiter, isAbsolute } from "node:path";
+
 /** Runtime configuration, read once at startup from the environment. */
 
 export interface Config {
@@ -7,13 +9,6 @@ export interface Config {
   readOnly: boolean;
   /** When true, mutating operations describe what they would send instead of sending it. */
   dryRun: boolean;
-  /**
-   * VAT regime the account lives under. `auto` (the default) infers it
-   * from the ledger at first use; explicit values win outright.
-   */
-  vatRegime: "regular" | "kleinunternehmer" | "auto";
-  /** Where vatRegime came from — `legacy-env` marks the deprecated boolean. */
-  vatRegimeSource: "env" | "legacy-env" | "default";
   requestTimeoutMs: number;
   maxRetries: number;
   /**
@@ -27,21 +22,77 @@ export interface Config {
   allowedReceiptDirs: string[];
 }
 
-function bool(value: string | undefined, fallback = false): boolean {
-  if (value === undefined) return fallback;
-  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+function bool(name: string, value: string | undefined, fallback = false): boolean {
+  const t = value?.trim().toLowerCase() ?? "";
+  if (t === "") return fallback;
+  if (["1", "true", "yes", "on"].includes(t)) return true;
+  if (["0", "false", "no", "off"].includes(t)) return false;
+  throw new Error(`${name} must be one of 1/true/yes/on or 0/false/no/off (got '${value}').`);
 }
 
-function int(value: string | undefined, fallback: number): number {
-  const n = Number.parseInt(value ?? "", 10);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
+/** A whole number >= min; empty means the default, anything else invalid throws. */
+function int(name: string, value: string | undefined, fallback: number, min: number): number {
+  const t = value?.trim() ?? "";
+  if (t === "") return fallback;
+  const n = Number(t);
+  if (!Number.isInteger(n) || n < min) throw new Error(`${name} must be a whole number >= ${min} (got '${value}').`);
+  return n;
 }
 
-/** Like {@link int} but fractional and with an explicit 0 meaning "disabled". */
-function rate(value: string | undefined, fallback: number): number {
-  if (value === undefined || value.trim() === "") return fallback;
-  const n = Number(value);
-  return Number.isFinite(n) && n >= 0 ? n : fallback;
+/** Fractional, with an explicit 0 meaning "disabled". */
+function rate(name: string, value: string | undefined, fallback: number): number {
+  const t = value?.trim() ?? "";
+  if (t === "") return fallback;
+  const n = Number(t);
+  if (!Number.isFinite(n) || n < 0) throw new Error(`${name} must be a number >= 0 (got '${value}').`);
+  return n;
+}
+
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/**
+ * The token travels as a header, so the base URL must be https. Plain http is
+ * allowed for loopback only, so local proxies and test servers keep working.
+ */
+function parseBaseUrl(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`SEVDESK_BASE_URL is not a valid URL: ${raw}`);
+  }
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname))) {
+    throw new Error(
+      `SEVDESK_BASE_URL must use https:// (got ${url.protocol}//${url.host}) — the API token is ` +
+        "sent as a header and must not travel in cleartext. http:// is only accepted for " +
+        "localhost, 127.0.0.1 and [::1].",
+    );
+  }
+  if (url.search || url.hash || url.username || url.password) {
+    throw new Error(
+      "SEVDESK_BASE_URL must not carry a query string, fragment or credentials — " +
+        "the token goes in SEVDESK_API_TOKEN, and paths are appended to the base.",
+    );
+  }
+  // Rebuilt from the parsed URL so a bare "?" / "#" or stray whitespace cannot leak into requests.
+  return (url.origin + url.pathname).replace(/\/+$/, "");
+}
+
+/** Split on the platform delimiter (":" or ";" on Windows) and refuse relative entries. */
+function parseReceiptDirs(raw: string | undefined): string[] {
+  const dirs = (raw ?? "")
+    .split(delimiter)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const d of dirs) {
+    if (!isAbsolute(d)) {
+      throw new Error(
+        `SEVDESK_RECEIPT_DIRS entry '${d}' is not an absolute path — a relative entry would ` +
+          "resolve against whatever directory the MCP client launched this server in.",
+      );
+    }
+  }
+  return dirs;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
@@ -54,41 +105,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
 
-  // SEVDESK_VAT_REGIME wins; the deprecated boolean applies only when it
-  // is unset. A typo must fail loudly, not silently become `auto`.
-  let vatRegime: Config["vatRegime"] = "auto";
-  let vatRegimeSource: Config["vatRegimeSource"] = "default";
-  const rawRegime = env.SEVDESK_VAT_REGIME?.trim().toLowerCase();
-  if (rawRegime) {
-    if (rawRegime === "regular" || rawRegime === "kleinunternehmer" || rawRegime === "auto") {
-      vatRegime = rawRegime;
-      vatRegimeSource = rawRegime === "auto" ? "default" : "env";
-    } else {
-      throw new Error(
-        `SEVDESK_VAT_REGIME='${env.SEVDESK_VAT_REGIME}' is not valid. ` +
-          `Use 'regular', 'kleinunternehmer' or 'auto'.`,
-      );
-    }
-  } else if (bool(env.SEVDESK_KLEINUNTERNEHMER, false)) {
-    vatRegime = "kleinunternehmer";
-    vatRegimeSource = "legacy-env";
-  }
-
   return {
     apiToken,
-    baseUrl: (env.SEVDESK_BASE_URL ?? "https://my.sevdesk.de/api/v1").replace(/\/+$/, ""),
-    readOnly: bool(env.SEVDESK_READ_ONLY, false),
-    dryRun: bool(env.SEVDESK_DRY_RUN, false),
-    vatRegime,
-    vatRegimeSource,
-    requestTimeoutMs: int(env.SEVDESK_TIMEOUT_MS, 30_000),
-    maxRetries: int(env.SEVDESK_MAX_RETRIES, 3),
-    rateLimitPerSec: rate(env.SEVDESK_RATE_LIMIT, 4),
-    debug: bool(env.SEVDESK_DEBUG, false),
-    allowedReceiptDirs: (env.SEVDESK_RECEIPT_DIRS ?? "")
-      .split(":")
-      .map((s) => s.trim())
-      .filter(Boolean),
+    baseUrl: parseBaseUrl(env.SEVDESK_BASE_URL ?? "https://my.sevdesk.de/api/v1"),
+    readOnly: bool("SEVDESK_READ_ONLY", env.SEVDESK_READ_ONLY),
+    dryRun: bool("SEVDESK_DRY_RUN", env.SEVDESK_DRY_RUN),
+    requestTimeoutMs: int("SEVDESK_TIMEOUT_MS", env.SEVDESK_TIMEOUT_MS, 30_000, 1),
+    maxRetries: int("SEVDESK_MAX_RETRIES", env.SEVDESK_MAX_RETRIES, 3, 0),
+    rateLimitPerSec: rate("SEVDESK_RATE_LIMIT", env.SEVDESK_RATE_LIMIT, 4),
+    debug: bool("SEVDESK_DEBUG", env.SEVDESK_DEBUG),
+    allowedReceiptDirs: parseReceiptDirs(env.SEVDESK_RECEIPT_DIRS),
   };
 }
 

@@ -6,7 +6,7 @@
 
 Connect Claude (or any MCP client) to your sevDesk account: list and create vouchers and invoices, reconcile bank transactions, reach all 151 API operations — and run audits that know what a *wrong* booking looks like: a foreign supplier booked as domestic 0 % instead of Reverse Charge §13b, a tax rule the booking account doesn't allow, a payment with no receipt behind it.
 
-> **Status: v0.4.0.** Live-validated against a real sevDesk account (bookkeeping system 2.0) — where the audit found exactly the class of mis-booking it was built for. See [CHANGELOG.md](CHANGELOG.md).
+> **Status: v0.5.0.** Live-validated against a real sevDesk account (bookkeeping system 2.0) — where the audit found exactly the class of mis-booking it was built for. See [CHANGELOG.md](CHANGELOG.md).
 
 ## Quick start
 
@@ -135,16 +135,14 @@ essentials.
 | Variable | Default | Purpose |
 |---|---|---|
 | `SEVDESK_API_TOKEN` | *(required)* | Your sevDesk API token |
-| `SEVDESK_READ_ONLY` | `false` | Hide write tools; `sevdesk_call` stays listed but refuses mutating operations at call time |
-| `SEVDESK_DRY_RUN` | `false` | Show what a write *would* send, without sending it |
-| `SEVDESK_VAT_REGIME` | `auto` | `regular`, `kleinunternehmer` (§19 UStG) or `auto`. `auto` infers the regime from your recent invoices; `sevdesk_ping` reports what was detected and why. Tax-rule defaults and audit suggestions follow the regime. An explicit value that contradicts the ledger is reported as an audit finding, never silently trusted |
-| `SEVDESK_KLEINUNTERNEHMER` | `false` | Deprecated — use `SEVDESK_VAT_REGIME=kleinunternehmer`. Still honored when `SEVDESK_VAT_REGIME` is unset |
-| `SEVDESK_RECEIPT_DIRS` | *(unset — file tools disabled)* | Colon-separated allowlist of directories the receipt file tools may read and write |
-| `SEVDESK_BASE_URL` | `https://my.sevdesk.de/api/v1` | Override the API host |
-| `SEVDESK_TIMEOUT_MS` | `30000` | Per-request timeout |
-| `SEVDESK_MAX_RETRIES` | `3` | Retries with jittered backoff and a clamped `Retry-After`. A 429 is always retried (the throttled call never ran); a 5xx or network failure is retried **only for reads** — a write is never replayed on an ambiguous failure, so a timeout cannot create a duplicate draft |
+| `SEVDESK_READ_ONLY` | `false` | Boolean (`1/true/yes/on` or `0/false/no/off`; anything else fails at startup). Hide write tools; `sevdesk_call` stays listed but refuses mutating operations at call time |
+| `SEVDESK_DRY_RUN` | `false` | Boolean, same accepted values. Show what a write *would* send, without sending it |
+| `SEVDESK_RECEIPT_DIRS` | *(unset — file tools disabled)* | Allowlist of **absolute** directories the receipt file tools may read and write, separated by the platform path separator (`:` on macOS/Linux, `;` on Windows). Symlinks are resolved, so a link pointing outside the list is refused |
+| `SEVDESK_BASE_URL` | `https://my.sevdesk.de/api/v1` | Override the API host. Must be `https://` (the token is sent as a header); plain `http://` is accepted only for `localhost`, `127.0.0.1` and `[::1]` |
+| `SEVDESK_TIMEOUT_MS` | `30000` | Per-request timeout (whole number > 0) |
+| `SEVDESK_MAX_RETRIES` | `3` | Whole number >= 0; `0` means no retries at all. Retries with jittered backoff and a clamped `Retry-After`. A 429 is always retried (the throttled call never ran); a 5xx or network failure is retried **only for reads** — a write is never replayed on an ambiguous failure, so a timeout cannot create a duplicate draft |
 | `SEVDESK_RATE_LIMIT` | `4` | Client-side pacing in requests/second (token bucket), so bursty audit fan-outs don't collide with sevDesk's throttle. `0` disables pacing |
-| `SEVDESK_DEBUG` | `false` | Log `METHOD /path -> status` to stderr — never query strings, bodies or the token |
+| `SEVDESK_DEBUG` | `false` | Boolean, same accepted values. Log `METHOD /path -> status` to stderr — never query strings, bodies or the token |
 
 Set these in the `env` block of your MCP client — that is the supported path and the
 one the client controls. For runs outside a client (`npm run dev`, `node dist/index.js`
@@ -161,7 +159,7 @@ Everything runs locally: your token and accounting data flow only between your M
 
 ## Write safety
 
-Read-only mode is enforced three times: write tools are hidden from the tool list, the dispatcher refuses them, and the HTTP client refuses every mutating request independently. With writes enabled:
+Read-only mode is enforced three times: write tools are hidden from the tool list, the dispatcher refuses them, and the HTTP client refuses every mutating request independently. `sevdesk_call` treats GETs that change state (`sendByWithRender`, a truthy `enshrine*` flag, `preventSendBy` turned off) as writes. With writes enabled:
 
 - Every write tool accepts a per-call `dryRun` and honors the global `SEVDESK_DRY_RUN`.
 - `sevdesk_create_voucher` and `sevdesk_create_invoice` default to **drafts** — nothing is booked or sent silently.

@@ -1,5 +1,5 @@
 import { readFile, stat, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, extname, isAbsolute, join, resolve } from "node:path";
 
 import {
   INVOICE_STATUS,
@@ -14,19 +14,26 @@ import {
   ymd,
 } from "../lib/vat.js";
 import {
+  assertAllowedDir,
   assertAllowedPath,
   bool,
+  getAllCapped,
+  truncationFields,
   int,
   isDryRun,
+  isPlainObject,
   obj,
-  optNumber,
+  optId,
+  optLimit,
+  optRuleId,
   optString,
+  positionObjects,
+  requireId,
   requireString,
   str,
   type ToolContext,
   type ToolDef,
 } from "../lib/tool.js";
-import { regimeMismatch } from "../lib/profile.js";
 
 /** Rule ids the sevDesk API accepts on vouchers — one source for schema enums and error texts. */
 const VOUCHER_RULE_IDS = Object.entries(TAX_RULES)
@@ -76,7 +83,7 @@ const ping: ToolDef = {
   title: "Check the sevDesk connection",
   description:
     "Verify the API token, report server mode, bookkeeping generation (1.0 taxType / " +
-    "2.0 taxRule) and the account's detected VAT regime. Run this first.",
+    "2.0 taxRule). Run this first.",
   mutating: false,
   inputSchema: { type: "object", properties: {}, additionalProperties: false },
   async handler(_args, ctx) {
@@ -95,20 +102,11 @@ const ping: ToolDef = {
       // Some accounts may not expose the endpoint; the ping itself still counts.
     }
 
-    const profile = await ctx.getProfile();
-    const mismatch = regimeMismatch(profile);
-
     return {
       ok: status === 200,
       baseUrl: ctx.config.baseUrl,
       bookkeepingSystemVersion: version,
       mode: ctx.config.readOnly ? "READ-ONLY" : ctx.config.dryRun ? "DRY-RUN" : "read/write",
-      vatProfile: {
-        regime: profile.regime,
-        source: profile.source,
-        evidence: profile.evidence,
-        ...(mismatch ? { warning: mismatch } : {}),
-      },
       receiptDirsAllowed: ctx.config.allowedReceiptDirs.length
         ? ctx.config.allowedReceiptDirs
         : "file tools disabled (SEVDESK_RECEIPT_DIRS not set)",
@@ -130,7 +128,8 @@ const listVouchers: ToolDef = {
       to: str("End date, dd.mm.yyyy or yyyy-mm-dd."),
       supplier: str("Case-insensitive substring of the supplier name."),
       status: str("Filter by status.", { enum: ["Entwurf", "offen", "bezahlt"] }),
-      limit: int("Maximum rows to return (default 200)."),
+      limit: int("Maximum rows to return (default 200).", { minimum: 1, maximum: 1000 }),
+      maxItems: int("Fetch cap: how many records are read from sevDesk before filtering (default 2000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
@@ -138,9 +137,10 @@ const listVouchers: ToolDef = {
     const p = period(args);
     const supplier = optString(args, "supplier")?.toLowerCase();
     const wanted = optString(args, "status");
-    const limit = optNumber(args, "limit") ?? 200;
+    const limit = optLimit(args, "limit", 200, 1000);
 
-    const all = await ctx.client.getAll<Row>("/Voucher", { embed: "supplier,taxRule" }, { maxItems: 2000 });
+    const maxItems = optLimit(args, "maxItems", 2000, 20_000);
+    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/Voucher", { embed: "supplier,taxRule" }, maxItems);
 
     const rows = all
       .filter((v) => within(parseSevdeskDate(v.voucherDate), p))
@@ -171,7 +171,12 @@ const listVouchers: ToolDef = {
       })
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
 
-    return { total: rows.length, returned: Math.min(rows.length, limit), vouchers: rows.slice(0, limit) };
+    return {
+      total: rows.length,
+      returned: Math.min(rows.length, limit),
+      ...truncationFields(truncated, { what: "vouchers", cap: maxItems, param: "maxItems" }),
+      vouchers: rows.slice(0, limit),
+    };
   },
 };
 
@@ -189,7 +194,7 @@ const getVoucher: ToolDef = {
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const id = requireString(args, "voucherId");
+    const id = requireId(args, "voucherId");
     const { data } = await ctx.client.request<{ objects?: Row[] }>({
       method: "GET",
       path: `/Voucher/${encodeURIComponent(id)}`,
@@ -244,14 +249,16 @@ const listInvoices: ToolDef = {
     properties: {
       from: str("Start date."),
       to: str("End date."),
-      limit: int("Maximum rows (default 200)."),
+      limit: int("Maximum rows (default 200).", { minimum: 1, maximum: 1000 }),
+      maxItems: int("Fetch cap: how many records are read from sevDesk before filtering (default 2000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
   async handler(args, ctx) {
     const p = period(args);
-    const limit = optNumber(args, "limit") ?? 200;
-    const all = await ctx.client.getAll<Row>("/Invoice", { embed: "contact,taxRule" }, { maxItems: 2000 });
+    const limit = optLimit(args, "limit", 200, 1000);
+    const maxItems = optLimit(args, "maxItems", 2000, 20_000);
+    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/Invoice", { embed: "contact,taxRule" }, maxItems);
     const rows = all
       .filter((i) => within(parseSevdeskDate(i.invoiceDate), p))
       .map((i) => {
@@ -271,7 +278,7 @@ const listInvoices: ToolDef = {
         };
       })
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
-    return { total: rows.length, invoices: rows.slice(0, limit) };
+    return { total: rows.length, returned: Math.min(rows.length, limit), ...truncationFields(truncated, { what: "invoices", cap: maxItems, param: "maxItems" }), invoices: rows.slice(0, limit) };
   },
 };
 
@@ -298,7 +305,9 @@ const summarize: ToolDef = {
       }),
       maxGroups: int(
         "Cap on returned groups; the remainder is folded into one '(andere)' entry (default 40).",
+        { minimum: 1, maximum: 1000 },
       ),
+      maxItems: int("Fetch cap: how many records are read from sevDesk before filtering (default 10000).", { minimum: 1, maximum: 20000 }),
     },
     required: ["kind"],
     additionalProperties: false,
@@ -311,14 +320,13 @@ const summarize: ToolDef = {
     const p = period(args);
     const groupBy = optString(args, "groupBy") ?? "month";
     const side = optString(args, "side") ?? "any";
-    const maxGroups = Math.max(1, optNumber(args, "maxGroups") ?? 40);
+    const maxGroups = optLimit(args, "maxGroups", 40, 1000);
 
-    const MAX_ITEMS = 10_000;
-    const rows =
+    const MAX_ITEMS = optLimit(args, "maxItems", 10_000, 20_000);
+    const { rows, truncated } =
       kind === "invoices"
-        ? await ctx.client.getAll<Row>("/Invoice", { embed: "contact" }, { maxItems: MAX_ITEMS })
-        : await ctx.client.getAll<Row>("/Voucher", { embed: "supplier" }, { maxItems: MAX_ITEMS });
-    const truncated = rows.length >= MAX_ITEMS;
+        ? await getAllCapped<Row>(ctx, "/Invoice", { embed: "contact" }, MAX_ITEMS)
+        : await getAllCapped<Row>(ctx, "/Voucher", { embed: "supplier" }, MAX_ITEMS);
 
     const statusMap = kind === "invoices" ? INVOICE_STATUS : VOUCHER_STATUS;
     const keyOf = (r: Row, d: Date | null): string => {
@@ -387,7 +395,7 @@ const summarize: ToolDef = {
       scanned: rows.length,
       matched,
       ...(truncated
-        ? { truncated: true, note: `Only the first ${MAX_ITEMS} rows were scanned.` }
+        ? truncationFields(true, { what: kind, cap: MAX_ITEMS, param: "maxItems" })
         : {}),
       total: {
         count: total.count,
@@ -415,14 +423,16 @@ const listContacts: ToolDef = {
     type: "object",
     properties: {
       search: str("Case-insensitive substring of the contact name."),
-      limit: int("Maximum rows (default 200)."),
+      limit: int("Maximum rows (default 200).", { minimum: 1, maximum: 1000 }),
+      maxItems: int("Fetch cap: how many records are read from sevDesk before filtering (default 5000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
   async handler(args, ctx) {
     const search = optString(args, "search")?.toLowerCase();
-    const limit = optNumber(args, "limit") ?? 200;
-    const all = await ctx.client.getAll<Row>("/Contact", {}, { maxItems: 5000 });
+    const limit = optLimit(args, "limit", 200, 1000);
+    const maxItems = optLimit(args, "maxItems", 5000, 20_000);
+    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/Contact", {}, maxItems);
     const rows = all
       .map((c) => ({
         id: String(c.id ?? ""),
@@ -432,7 +442,7 @@ const listContacts: ToolDef = {
         taxNumber: c.taxNumber ?? null,
       }))
       .filter((c) => !search || String(c.name).toLowerCase().includes(search));
-    return { total: rows.length, contacts: rows.slice(0, limit) };
+    return { total: rows.length, returned: Math.min(rows.length, limit), ...truncationFields(truncated, { what: "contacts", cap: maxItems, param: "maxItems" }), contacts: rows.slice(0, limit) };
   },
 };
 
@@ -447,20 +457,22 @@ const listTransactions: ToolDef = {
       checkAccountId: str("Restrict to one bank account id."),
       from: str("Start date."),
       to: str("End date."),
-      limit: int("Maximum rows (default 200)."),
+      limit: int("Maximum rows (default 200).", { minimum: 1, maximum: 1000 }),
+      maxItems: int("Fetch cap: how many records are read from sevDesk before filtering (default 5000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
   async handler(args, ctx) {
     const p = period(args);
-    const accountId = optString(args, "checkAccountId");
-    const limit = optNumber(args, "limit") ?? 200;
+    const accountId = optId(args, "checkAccountId");
+    const limit = optLimit(args, "limit", 200, 1000);
     const query: Record<string, unknown> = {};
     if (accountId) {
       query["checkAccount[id]"] = accountId;
       query["checkAccount[objectName]"] = "CheckAccount";
     }
-    const all = await ctx.client.getAll<Row>("/CheckAccountTransaction", query, { maxItems: 5000 });
+    const maxItems = optLimit(args, "maxItems", 5000, 20_000);
+    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/CheckAccountTransaction", query, maxItems);
     const rows = all
       .filter((t) => within(parseSevdeskDate(t.valueDate ?? t.entryDate), p))
       .map((t) => {
@@ -475,52 +487,70 @@ const listTransactions: ToolDef = {
         };
       })
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
-    return { total: rows.length, transactions: rows.slice(0, limit) };
+    return { total: rows.length, returned: Math.min(rows.length, limit), ...truncationFields(truncated, { what: "transactions", cap: maxItems, param: "maxItems" }), transactions: rows.slice(0, limit) };
   },
 };
 
 /* ---------------------------- writes ------------------------------ */
 
+const MIME_BY_EXT: Record<string, string> = {
+  ".pdf": "application/pdf",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".xml": "application/xml",
+};
+
 const uploadVoucherFile: ToolDef = {
   name: "sevdesk_upload_voucher_file",
   title: "Upload a receipt file to sevDesk",
   description:
-    "Upload a local PDF/image to sevDesk's temporary voucher storage and return the filename " +
+    "Upload a local PDF/image/XML e-invoice to sevDesk's temporary voucher storage and return the filename " +
     "token you pass to sevdesk_create_voucher. WRITE operation — refused under SEVDESK_READ_ONLY.",
   mutating: true,
   inputSchema: {
     type: "object",
     properties: {
       filePath: str("Absolute path to the receipt file on this machine."),
-      mimeType: str("Override the content type (default guessed from the extension)."),
+      mimeType: str("Content type; required for extensions other than .pdf, .png, .jpg, .jpeg, .xml."),
       dryRun: bool("Preview the request without sending it."),
     },
     required: ["filePath"],
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const path = assertAllowedPath(ctx, requireString(args, "filePath"));
+    const rawPath = requireString(args, "filePath");
+    // Before resolve(): a relative path would otherwise be anchored to the cwd and pass.
+    if (!isAbsolute(rawPath)) throw new Error("File path must be absolute.");
+    const requested = resolve(rawPath);
+    // Containment and I/O use the real path; the name and content type come
+    // from what the caller asked for, so an allowlisted alias.pdf link works.
+    const path = await assertAllowedPath(ctx, requested);
     const info = await stat(path).catch(() => null);
     if (!info?.isFile()) throw new Error(`Not a file: ${path}`);
     if (info.size > 20 * 1024 * 1024) throw new Error("File is larger than 20 MB.");
 
-    const guessed = path.toLowerCase().endsWith(".pdf")
-      ? "application/pdf"
-      : path.toLowerCase().endsWith(".png")
-        ? "image/png"
-        : "image/jpeg";
+    // XML covers XRechnung / ZUGFeRD e-invoices. No fallback type: a wrong
+    // guess is stored as-is, so an unknown extension must be stated explicitly.
+    const guessed = MIME_BY_EXT[extname(requested).toLowerCase()];
     const mime = optString(args, "mimeType") ?? guessed;
+    if (!mime) {
+      throw new Error(
+        `Refused: cannot tell the content type of '${basename(requested)}'. Known extensions: ` +
+          `${Object.keys(MIME_BY_EXT).join(", ")} — or pass mimeType explicitly.`,
+      );
+    }
 
     if (isDryRun(args, ctx)) {
       return {
         dryRun: true,
-        wouldSend: { method: "POST", path: "/Voucher/Factory/uploadTempFile", file: path, bytes: info.size, mime },
+        wouldSend: { method: "POST", path: "/Voucher/Factory/uploadTempFile", file: requested, bytes: info.size, mime },
       };
     }
 
     const bytes = await readFile(path);
     const form = new FormData();
-    form.append("file", new Blob([new Uint8Array(bytes)], { type: mime }), basename(path));
+    form.append("file", new Blob([new Uint8Array(bytes)], { type: mime }), basename(requested));
 
     const { data } = await ctx.client.request<Row>({
       method: "POST",
@@ -528,7 +558,20 @@ const uploadVoucherFile: ToolDef = {
       form,
       mutating: true,
     });
-    return { uploaded: basename(path), bytes: info.size, response: data };
+    // sevDesk echoes a rendered preview of the upload back in `content` —
+    // tens of thousands of base64 characters that are worthless to a caller
+    // who needs the filename token. Keep the metadata, drop the blob.
+    const objects = (data as Row | undefined)?.objects;
+    const scrub = (o: unknown): unknown => {
+      if (!o || typeof o !== "object" || Array.isArray(o)) return o;
+      const meta: Row = { ...(o as Row) };
+      delete meta.content;
+      return meta;
+    };
+    let response: unknown = data;
+    if (Array.isArray(objects)) response = { ...(data as Row), objects: objects.map(scrub) };
+    else if (objects && typeof objects === "object") response = { ...(data as Row), objects: scrub(objects) };
+    return { uploaded: basename(requested), bytes: info.size, response };
   },
 };
 
@@ -548,7 +591,12 @@ const createVoucher: ToolDef = {
       supplierName: str("Supplier name as it should appear on the voucher."),
       voucherDate: str("Voucher date, dd.mm.yyyy."),
       description: str("Document/invoice number."),
-      taxRuleId: str("VAT regulation id.", { enum: ["1", "2", "3", "4", "5", "11"] }),
+      taxRuleId: str(
+        `VAT regulation id — every rule sevDesk accepts on a voucher, both sides. ` +
+          `Required — never guessed. sevdesk_receipt_guidance lists the ones the booking ` +
+          `account actually allows. Expense rules go with creditDebit C, revenue rules with D.`,
+        { enum: VOUCHER_RULE_IDS },
+      ),
       creditDebit: str("C = credit, D = debit.", { enum: ["C", "D"] }),
       status: str("50 = Entwurf, 100 = offen, 1000 = bezahlt (default 50).", {
         enum: ["50", "100", "1000"],
@@ -572,17 +620,43 @@ const createVoucher: ToolDef = {
       extra: obj("Additional top-level voucher fields merged into the payload verbatim."),
       dryRun: bool("Show the payload instead of sending it."),
     },
-    required: ["supplierName", "voucherDate", "positions"],
+    required: ["supplierName", "voucherDate", "taxRuleId", "positions"],
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const positionsIn = Array.isArray(args.positions) ? (args.positions as Row[]) : [];
+    const positionsIn = positionObjects(args);
     if (!positionsIn.length) throw new Error("At least one position is required.");
 
-    const status = optString(args, "status") ?? "50";
-    const taxRuleId = optString(args, "taxRuleId") ?? "1";
+    const statusRaw = typeof args.status === "number" ? String(args.status) : optString(args, "status");
+    if (statusRaw !== undefined && !["50", "100", "1000"].includes(statusRaw)) {
+      throw new Error(`status must be 50 (Entwurf), 100 (offen) or 1000 (bezahlt), not '${statusRaw}'.`);
+    }
+    const status = statusRaw ?? "50";
+    const cdRaw = optString(args, "creditDebit");
+    if (cdRaw !== undefined && cdRaw !== "C" && cdRaw !== "D") {
+      throw new Error(`creditDebit must be "C" or "D", not "${cdRaw}".`);
+    }
+    const creditDebit = cdRaw ?? "C";
+    const taxRuleId = optRuleId(args);
+    if (!taxRuleId) {
+      throw new Error(
+        "taxRuleId is required: the server does not guess a tax treatment. " +
+          "sevdesk_receipt_guidance lists the rules the booking account allows.",
+      );
+    }
+    const rule = TAX_RULES[taxRuleId as TaxRuleId];
+    if (!rule || !rule.usableInVouchers) {
+      throw new Error(`taxRuleId '${taxRuleId}' is not usable on a voucher (${VOUCHER_RULE_IDS.join(", ")}).`);
+    }
+    // C = expense, D = revenue: a rule from the other side books the voucher wrongly.
+    if (rule.side !== (creditDebit === "C" ? "expense" : "revenue")) {
+      throw new Error(
+        `taxRuleId ${taxRuleId} ("${rule.label}") is a ${rule.side} rule, but creditDebit ` +
+          `${creditDebit} is ${creditDebit === "C" ? "an expense" : "a revenue"} voucher.`,
+      );
+    }
 
-    const voucher: Row = {
+    const base: Row = {
       objectName: "Voucher",
       mapAll: true,
       voucherDate: requireString(args, "voucherDate"),
@@ -590,30 +664,81 @@ const createVoucher: ToolDef = {
       description: optString(args, "description"),
       status,
       taxRule: { id: taxRuleId, objectName: "TaxRule" },
-      creditDebit: optString(args, "creditDebit") ?? "C",
+      creditDebit,
       voucherType: "VOU",
       ...(optString(args, "payDate") ? { payDate: optString(args, "payDate") } : {}),
-      ...(optString(args, "fileName") ? { fileName: optString(args, "fileName") } : {}),
-      ...((args.extra as Row | undefined) ?? {}),
     };
+    // `extra` is for genuinely additional fields; it must not silently
+    // override what the tool's own arguments and guards decided.
+    if (args.extra !== undefined && !isPlainObject(args.extra)) {
+      throw new Error("extra must be an object of additional voucher fields.");
+    }
+    const extra = (args.extra ?? {}) as Row;
+    // taxType / taxSet are legacy tax fields that would contradict taxRule.
+    if ("fileName" in extra || "filename" in extra) {
+      throw new Error("Refused: pass the receipt via the top-level fileName argument, not extra.");
+    }
+    const collisions = Object.keys(extra).filter(
+      (k) => base[k] !== undefined || k === "taxType" || k === "taxSet",
+    );
+    if (collisions.length) {
+      throw new Error(
+        `Refused: extra would override field(s) this tool sets itself: ${collisions.join(", ")}. ` +
+          "Use the dedicated arguments instead.",
+      );
+    }
+    const voucher: Row = { ...base, ...extra };
 
-    const voucherPosSave = positionsIn.map((p) => {
-      const hasNet = typeof p.sumNet === "number";
+    const netFlags = new Set(positionsIn.map((p) => p.sumNet !== undefined && p.sumNet !== null));
+    if (netFlags.size > 1) {
+      throw new Error("Refused: positions mix sumNet and sumGross — a voucher is either all net or all gross.");
+    }
+
+    const voucherPosSave = positionsIn.map((p, i) => {
+      const at = `Position ${i + 1}`;
+      // No silent coercion: a missing rate must not become 0 %, a missing sum a 0 EUR position.
+      if (typeof p.taxRate !== "number" || !Number.isFinite(p.taxRate)) {
+        throw new Error(`${at}: taxRate must be a number.`);
+      }
+      if (rule.allowedRates !== null && !(rule.allowedRates as readonly number[]).includes(p.taxRate)) {
+        throw new Error(
+          `${at}: taxRate ${p.taxRate} is not allowed with rule ${taxRuleId} ("${rule.label}") — ` +
+            `allowed: ${rule.allowedRates.join(", ")}.`,
+        );
+      }
+      const given = (v: unknown) => v !== undefined && v !== null;
+      if (given(p.sumNet) === given(p.sumGross)) {
+        throw new Error(`${at}: give exactly one of sumNet or sumGross.`);
+      }
+      const sum = given(p.sumNet) ? p.sumNet : p.sumGross;
+      if (typeof sum !== "number" || !Number.isFinite(sum)) {
+        throw new Error(`${at}: ${given(p.sumNet) ? "sumNet" : "sumGross"} must be a finite number.`);
+      }
+      const hasNet = given(p.sumNet);
+      const accountingTypeId = optId(p, "accountingTypeId");
       return {
         objectName: "VoucherPos",
         mapAll: true,
-        accountingType: p.accountingTypeId
-          ? { id: String(p.accountingTypeId), objectName: "AccountingType" }
-          : undefined,
-        taxRate: num(p.taxRate),
+        accountingType: accountingTypeId ? { id: accountingTypeId, objectName: "AccountingType" } : undefined,
+        taxRate: p.taxRate,
         net: hasNet,
-        sumNet: hasNet ? num(p.sumNet) : undefined,
-        sumGross: !hasNet ? num(p.sumGross) : undefined,
+        sumNet: hasNet ? sum : undefined,
+        sumGross: !hasNet ? sum : undefined,
         comment: p.comment,
       };
     });
 
-    const payload = { voucher, voucherPosSave, voucherPosDelete: null };
+    // sevDesk takes the uploaded receipt as a TOP-LEVEL `filename` on the
+    // saveVoucher payload (schema `saveVoucher`), not as a voucher field —
+    // put in the wrong place it is silently ignored and the voucher is
+    // created without its document.
+    const attachment = optString(args, "fileName");
+    const payload = {
+      voucher,
+      voucherPosSave,
+      voucherPosDelete: null,
+      ...(attachment ? { filename: attachment } : {}),
+    };
 
     if (isDryRun(args, ctx)) {
       return { dryRun: true, wouldSend: { method: "POST", path: "/Voucher/Factory/saveVoucher", body: payload } };
@@ -651,7 +776,7 @@ const receiptGuidance: ToolDef = {
       query: str("Case-insensitive substring over account number, name and description."),
       accountNumber: str("Exact SKR account number, e.g. '6837'."),
       taxRuleId: str("Only accounts that allow this tax rule id, e.g. '12'."),
-      limit: int("Maximum accounts to return (default 20)."),
+      limit: int("Maximum accounts to return (default 20).", { minimum: 1, maximum: 1000 }),
     },
     additionalProperties: false,
   },
@@ -660,7 +785,7 @@ const receiptGuidance: ToolDef = {
     const query = optString(args, "query")?.toLowerCase();
     const accountNumber = optString(args, "accountNumber");
     const taxRuleId = optString(args, "taxRuleId");
-    const limit = optNumber(args, "limit") ?? 20;
+    const limit = optLimit(args, "limit", 20, 1000);
 
     const { data } = await ctx.client.request<{ objects?: Row[] }>({
       method: "GET",
@@ -720,8 +845,8 @@ const setTaxRule: ToolDef = {
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const id = requireString(args, "voucherId");
-    const target = requireString(args, "taxRuleId") as TaxRuleId;
+    const id = requireId(args, "voucherId");
+    const target = (optRuleId(args) ?? requireString(args, "taxRuleId")) as TaxRuleId;
     if (!VOUCHER_RULE_IDS.includes(target)) {
       throw new Error(
         `taxRule '${target}' cannot be used on vouchers. Usable rules: ${VOUCHER_RULE_IDS.join(", ")}.`,
@@ -730,6 +855,14 @@ const setTaxRule: ToolDef = {
     const rule = TAX_RULES[target];
 
     const v = await fetchUnenshrined(ctx, "Voucher", id);
+    // Learned on live data: the API only updates drafts, and resetting a paid
+    // foreign-currency voucher recalculates its EUR amounts at today's rate.
+    if (String(v.status) !== "50") {
+      throw new Error(
+        `Refused: voucher ${id} is ${VOUCHER_STATUS[String(v.status)] ?? `status ${v.status}`}, not a ` +
+          "draft (Entwurf). Change the tax rule of booked or paid vouchers in the sevDesk UI.",
+      );
+    }
     const before = readTaxTreatment(v);
     const side = voucherSide(v) ?? rule.side;
     if (side !== rule.side) {
@@ -811,7 +944,7 @@ const createInvoice: ToolDef = {
       },
       invoiceDate: str("Invoice date, yyyy-mm-dd (default today)."),
       header: str("Optional invoice header text."),
-      taxRuleId: str("Revenue tax rule id. Default follows the account's VAT regime: 1 (regular) or 11 (§19 Kleinunternehmer); required if the regime cannot be detected.", {
+      taxRuleId: str("Revenue tax rule id — required, never guessed. 1 taxable domestic, 2 export, 3 intra-EU supply, 4 §4 exempt, 5 §13b, 11 §19 UStG (no VAT shown), 17 not taxable domestically, 18-20 One Stop Shop (per-position taxRate required), 21 §18b.", {
         // Model_Invoice.taxRule per the sevDesk spec — invoices accept the OSS
         // and §18b rules that vouchers refuse, and not the guidance-only 22.
         enum: ["1", "2", "3", "4", "5", "11", "17", "18", "19", "20", "21"],
@@ -819,34 +952,27 @@ const createInvoice: ToolDef = {
       currency: str("Currency (default EUR)."),
       dryRun: bool("Preview the request without sending it."),
     },
-    required: ["contactId", "positions"],
+    required: ["contactId", "taxRuleId", "positions"],
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const contactId = requireString(args, "contactId");
-    const positions = Array.isArray(args.positions) ? (args.positions as Row[]) : [];
+    const contactId = requireId(args, "contactId");
+    const positions = positionObjects(args);
     if (positions.length === 0) throw new Error("At least one position is required.");
 
-    // The regime only chooses the default RULE; the rule then dictates the
-    // default rate. An account whose regime cannot be detected gets no
-    // silent default — a wrong guess is a wrong legal document either way.
-    let ruleId = optString(args, "taxRuleId");
+    const ruleId = optRuleId(args);
     if (!ruleId) {
-      const profile = await ctx.getProfile();
-      if (profile.regime === "unknown") {
-        throw new Error(
-          "Cannot choose a tax rule: the account's VAT regime is unknown " +
-            `(${profile.evidence}). Pass taxRuleId explicitly — 1 for regular VAT, ` +
-            "11 for §19 Kleinunternehmer — or set SEVDESK_VAT_REGIME.",
-        );
-      }
-      ruleId = profile.regime === "kleinunternehmer" ? "11" : "1";
+      throw new Error(
+        "taxRuleId is required: the server does not guess a tax treatment. " +
+          "Rules: 1 taxable domestic, 2 export, 3 intra-EU supply, 4 §4 exempt, 5 §13b, " +
+          "11 §19 UStG, 17 not taxable domestically, 18-20 One Stop Shop, 21 §18b.",
+      );
     }
     const rule = TAX_RULES[ruleId as TaxRuleId];
     if (!rule || rule.side !== "revenue" || ruleId === "22") {
       throw new Error(`taxRuleId '${ruleId}' is not a usable invoice revenue rule.`);
     }
-    // OSS rules have destination-dependent rates — no default is safe.
+    // The rule dictates the default rate. OSS rules have destination-dependent rates — no default is safe.
     const defaultRate =
       rule.allowedRates === null ? null : (rule.allowedRates as readonly number[]).includes(19) ? 19 : 0;
     const date = optString(args, "invoiceDate") ?? ymd(new Date());
@@ -865,16 +991,35 @@ const createInvoice: ToolDef = {
             "One Stop Shop rates depend on the destination country.",
         );
       }
+      if (typeof p.name !== "string" || p.name.trim() === "") {
+        throw new Error(`Position ${i + 1}: name must be a non-empty string.`);
+      }
+      if (typeof p.price !== "number" || !Number.isFinite(p.price)) {
+        throw new Error(`Position ${i + 1}: price must be a finite number.`);
+      }
+      const taxRate = typeof p.taxRate === "number" ? p.taxRate : (defaultRate as number);
+      if (rule.allowedRates !== null && !(rule.allowedRates as readonly number[]).includes(taxRate)) {
+        throw new Error(
+          `Position ${i + 1}: taxRate ${taxRate} is not allowed with rule ${ruleId} ("${rule.label}") — ` +
+            `allowed: ${rule.allowedRates.join(", ")}.`,
+        );
+      }
       return {
         objectName: "InvoicePos",
         mapAll: true,
-        name: String(p.name ?? ""),
+        name: p.name,
         quantity,
-        price: num(p.price),
-        taxRate: typeof p.taxRate === "number" ? p.taxRate : (defaultRate as number),
+        price: p.price,
+        taxRate,
         unity: { id: 1, objectName: "Unity" },
       };
     });
+
+    // The invoice-level rate/text follow the positions when they agree. When
+    // they differ no single percentage is true, so keep the rule's default
+    // rate and use the rule's label as text rather than state one rate.
+    const rates = new Set(invoicePosSave.map((p) => p.taxRate));
+    const uniformRate = rates.size === 1 ? invoicePosSave[0]!.taxRate : null;
 
     const body = {
       invoice: {
@@ -887,12 +1032,12 @@ const createInvoice: ToolDef = {
         currency: optString(args, "currency") ?? "EUR",
         contact: { id: Number(contactId), objectName: "Contact" },
         taxRule: { id: ruleId, objectName: "TaxRule" },
-        taxRate: defaultRate ?? num(invoicePosSave[0]?.taxRate),
+        taxRate: uniformRate ?? defaultRate ?? num(invoicePosSave[0]?.taxRate),
         taxText:
           ruleId === "11"
             ? "Gemäß § 19 UStG wird keine Umsatzsteuer berechnet."
-            : defaultRate && defaultRate > 0
-              ? `Umsatzsteuer ${defaultRate}%`
+            : uniformRate !== null && uniformRate > 0
+              ? `Umsatzsteuer ${uniformRate}%`
               : rule.label,
         discount: 0,
         ...(optString(args, "header") ? { header: optString(args, "header") } : {}),
@@ -943,8 +1088,9 @@ const getInvoicePdf: ToolDef = {
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const id = requireString(args, "invoiceId");
-    const dir = assertAllowedPath(ctx, requireString(args, "directory"));
+    const id = requireId(args, "invoiceId");
+    // Checked before the network call: no point fetching a PDF we cannot write.
+    const dir = await assertAllowedDir(ctx, requireString(args, "directory"));
 
     const { data } = await ctx.client.request<Row>({
       method: "GET",
@@ -964,7 +1110,8 @@ const getInvoicePdf: ToolDef = {
     }
     // The filename comes from the API — keep only its basename so it cannot
     // point outside the allowlisted directory.
-    const filename = basename(String(meta?.filename ?? `invoice-${id}.pdf`));
+    let filename = basename(String(meta?.filename ?? ""));
+    if (!/^[\p{L}\p{N}_.\- ]+\.pdf$/iu.test(filename) || filename.startsWith("..")) filename = `invoice-${id}.pdf`;
     const target = join(dir, filename);
     const bytes = Buffer.from(content, "base64");
     // flag wx: never clobber an existing file in the user's receipt archive.
@@ -998,7 +1145,7 @@ const markInvoiceSent: ToolDef = {
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const id = requireString(args, "invoiceId");
+    const id = requireId(args, "invoiceId");
     const sendType = optString(args, "sendType") ?? "VPDF";
 
     await fetchUnenshrined(ctx, "Invoice", id);

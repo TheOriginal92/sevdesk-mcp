@@ -12,17 +12,15 @@ right order with few tokens, not about safety.
 
 ## Orientation (once per session)
 
-1. `sevdesk_ping` — verifies the token and returns three facts that
+1. `sevdesk_ping` — verifies the token and returns two facts that
    change how you should work:
    - `mode`: READ-ONLY / DRY-RUN / read-write.
    - `bookkeepingSystemVersion`: 1.0 books with `taxType`, 2.0 with
      `taxRule`. Old documents may carry either; the tools decode both.
-   - `vatProfile`: the account's VAT regime (`regular` vs
-     `kleinunternehmer` §19 UStG) with the evidence for the verdict.
-     If it carries a `warning`, the configuration contradicts the
-     ledger — surface that to the user before trusting tax advice.
-2. If the regime is `unknown`, ask the user (regular VAT or §19?) before
-   creating invoices — `sevdesk_create_invoice` will refuse to guess.
+2. The server never guesses a tax rule: `sevdesk_create_invoice` and
+   `sevdesk_create_voucher` require `taxRuleId`. Ask the user which
+   treatment applies (regular VAT, §19 UStG, reverse charge…), and for
+   vouchers read the allowed rules from `sevdesk_receipt_guidance`.
 
 ## Monthly close
 
@@ -31,7 +29,7 @@ Run in this order; each step's output feeds the next conversation turn:
 1. `sevdesk_find_duplicates` for the month — resolve duplicates first,
    they distort every later number.
 2. `sevdesk_audit_vat` with `from`/`to` for the month. Work findings by
-   severity; `vat_regime_mismatch` first if present (it biases the rest).
+   severity.
 3. `sevdesk_reverse_charge_report` for the month — give the user the
    §13b bases for the VAT return (deductible nets to zero but must be
    declared; rule 13 VAT is actually payable).
@@ -54,14 +52,15 @@ Run in this order; each step's output feeds the next conversation turn:
 
 1. Is the supplier established abroad? The contact's country is
    authoritative; the name suffix (Inc, Ltd, SARL…) is only a hint.
-2. Service from abroad → Reverse Charge. Which rule depends on the
-   regime `sevdesk_ping` reported:
-   - regular VAT: rule 12 (§13b Abs. 2) or 14 (§13b Abs. 1 EU) — output
-     tax and input tax cancel, but both must be declared; rule 8 for
-     intra-EU goods.
-   - Kleinunternehmer: rule 13 — no input-tax deduction, the VAT is
-     genuinely payable. This is the finding users most often disbelieve;
-     point them to §19 Abs. 1 UStG.
+2. Service from abroad → Reverse Charge. Which rule depends on
+   whether the user can deduct input tax — ask, and confirm against
+   `sevdesk_receipt_guidance`:
+   - with input-tax deduction: rule 12 (§13b Abs. 2) or 14 (§13b Abs. 1
+     EU) — output tax and input tax cancel, but both must be declared;
+     rule 8 for intra-EU goods.
+   - without input-tax deduction (e.g. a §19 UStG business): rule 13 —
+     the VAT is genuinely payable. This is the finding users most often
+     disbelieve; point them to §19 Abs. 1 UStG.
 3. Domestic 0 % expense → rule 10, not a reverse-charge rule.
 4. `sevdesk_set_tax_rule` fixes drafts only — booked vouchers must be
    corrected in the sevDesk UI (resetting a paid foreign-currency
@@ -69,8 +68,6 @@ Run in this order; each step's output feeds the next conversation turn:
 
 ## Interpreting audit findings
 
-- `vat_regime_mismatch` — configuration vs ledger contradiction; resolve
-  before acting on any other tax suggestion.
 - `zero_rate_booked_as_domestic` — the classic missed reverse charge;
   severity encodes the evidence (contact country > name heuristic).
 - `reverse_charge_with_vat` — §13b rule but positions carry VAT; one of

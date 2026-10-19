@@ -6,7 +6,7 @@
 
 Verbinde Claude (oder jeden anderen MCP-Client) mit deinem sevDesk-Konto: Belege und Rechnungen auflisten und anlegen, Banktransaktionen abgleichen, alle 151 API-Operationen erreichen — und Prüfungen laufen lassen, die wissen, wie eine *falsche* Buchung aussieht: ein ausländischer Lieferant als inländische 0 % statt Reverse Charge §13b, eine Steuerregel, die das Buchungskonto nicht erlaubt, eine Zahlung ohne Beleg dahinter.
 
-> **Status: v0.4.0.** Gegen ein echtes sevDesk-Konto validiert (Buchhaltungssystem 2.0) — wo die Prüfung genau die Klasse von Fehlbuchungen fand, für die sie gebaut wurde. Siehe [CHANGELOG.md](CHANGELOG.md).
+> **Status: v0.5.0.** Gegen ein echtes sevDesk-Konto validiert (Buchhaltungssystem 2.0) — wo die Prüfung genau die Klasse von Fehlbuchungen fand, für die sie gebaut wurde. Siehe [CHANGELOG.md](CHANGELOG.md).
 
 ## Schnellstart
 
@@ -132,16 +132,14 @@ des Servers und die Tool-Beschreibungen tragen das Wesentliche.
 | Variable | Standard | Zweck |
 |---|---|---|
 | `SEVDESK_API_TOKEN` | *(erforderlich)* | Dein sevDesk-API-Token |
-| `SEVDESK_READ_ONLY` | `false` | Blendet Schreib-Tools aus; `sevdesk_call` bleibt sichtbar, verweigert aber schreibende Operationen beim Aufruf |
-| `SEVDESK_DRY_RUN` | `false` | Zeigt, was ein Schreibzugriff senden *würde*, ohne zu senden |
-| `SEVDESK_VAT_REGIME` | `auto` | `regular`, `kleinunternehmer` (§19 UStG) oder `auto`. `auto` erkennt das Regime aus den letzten Rechnungen; `sevdesk_ping` zeigt Ergebnis und Begründung. Steuerregel-Defaults und Prüfungs-Empfehlungen folgen dem Regime. Ein expliziter Wert, der dem Buchungsbestand widerspricht, wird als Prüfungs-Finding gemeldet — nie stillschweigend übernommen |
-| `SEVDESK_KLEINUNTERNEHMER` | `false` | Veraltet — bitte `SEVDESK_VAT_REGIME=kleinunternehmer` verwenden. Wird weiter beachtet, solange `SEVDESK_VAT_REGIME` nicht gesetzt ist |
-| `SEVDESK_RECEIPT_DIRS` | *(nicht gesetzt — Datei-Tools deaktiviert)* | Doppelpunkt-getrennte Positivliste der Verzeichnisse für die Beleg-Datei-Tools |
-| `SEVDESK_BASE_URL` | `https://my.sevdesk.de/api/v1` | API-Host überschreiben |
-| `SEVDESK_TIMEOUT_MS` | `30000` | Timeout pro Anfrage |
-| `SEVDESK_MAX_RETRIES` | `3` | Wiederholungen mit gejittertem Backoff und begrenztem `Retry-After`. Ein 429 wird immer wiederholt (der gedrosselte Aufruf lief nie); ein 5xx oder Netzwerkfehler nur bei **Lesezugriffen** — ein Schreibzugriff wird bei unklarem Ausgang nie erneut gesendet, ein Timeout kann also keinen doppelten Entwurf erzeugen |
+| `SEVDESK_READ_ONLY` | `false` | Boolean (`1/true/yes/on` oder `0/false/no/off`; alles andere bricht den Start ab). Blendet Schreib-Tools aus; `sevdesk_call` bleibt sichtbar, verweigert aber schreibende Operationen beim Aufruf |
+| `SEVDESK_DRY_RUN` | `false` | Boolean, gleiche Werte. Zeigt, was ein Schreibzugriff senden *würde*, ohne zu senden |
+| `SEVDESK_RECEIPT_DIRS` | *(nicht gesetzt — Datei-Tools deaktiviert)* | Positivliste **absoluter** Verzeichnisse für die Beleg-Datei-Tools, getrennt durch das Pfadtrennzeichen der Plattform (`:` unter macOS/Linux, `;` unter Windows). Symlinks werden aufgelöst; ein Link, der aus der Liste hinausführt, wird abgelehnt |
+| `SEVDESK_BASE_URL` | `https://my.sevdesk.de/api/v1` | API-Host überschreiben. Muss `https://` sein (das Token wird als Header gesendet); `http://` ist nur für `localhost`, `127.0.0.1` und `[::1]` erlaubt |
+| `SEVDESK_TIMEOUT_MS` | `30000` | Timeout pro Anfrage (ganze Zahl > 0) |
+| `SEVDESK_MAX_RETRIES` | `3` | Ganze Zahl >= 0; `0` heißt: gar keine Wiederholungen. Wiederholungen mit gejittertem Backoff und begrenztem `Retry-After`. Ein 429 wird immer wiederholt (der gedrosselte Aufruf lief nie); ein 5xx oder Netzwerkfehler nur bei **Lesezugriffen** — ein Schreibzugriff wird bei unklarem Ausgang nie erneut gesendet, ein Timeout kann also keinen doppelten Entwurf erzeugen |
 | `SEVDESK_RATE_LIMIT` | `4` | Clientseitige Drosselung in Requests/Sekunde (Token-Bucket), damit Audit-Abfragesalven nicht mit sevDesks Limit kollidieren. `0` deaktiviert |
-| `SEVDESK_DEBUG` | `false` | Loggt `METHOD /pfad -> status` auf stderr — nie Query-Strings, Bodies oder den Token |
+| `SEVDESK_DEBUG` | `false` | Boolean, gleiche Werte. Loggt `METHOD /pfad -> status` auf stderr — nie Query-Strings, Bodies oder den Token |
 
 Diese Variablen gehören in den `env`-Block deines MCP-Clients — das ist der
 unterstützte Weg und der, den der Client kontrolliert. Für Läufe außerhalb eines
@@ -160,7 +158,7 @@ Alles läuft lokal: Token und Buchhaltungsdaten fließen ausschließlich zwische
 
 ## Schreibsicherheit
 
-Der Nur-Lesen-Modus greift dreifach: Schreib-Tools verschwinden aus der Tool-Liste, der Dispatcher verweigert sie, und der HTTP-Client verweigert jede schreibende Anfrage unabhängig davon. Mit aktivierten Schreibzugriffen:
+Der Nur-Lesen-Modus greift dreifach: Schreib-Tools verschwinden aus der Tool-Liste, der Dispatcher verweigert sie, und der HTTP-Client verweigert jede schreibende Anfrage unabhängig davon. `sevdesk_call` behandelt zustandsändernde GETs (`sendByWithRender`, ein gesetztes `enshrine*`-Flag, abgeschaltetes `preventSendBy`) als Schreibzugriffe. Mit aktivierten Schreibzugriffen:
 
 - Jedes Schreib-Tool akzeptiert ein `dryRun` pro Aufruf und beachtet das globale `SEVDESK_DRY_RUN`.
 - `sevdesk_create_voucher` und `sevdesk_create_invoice` erstellen **Entwürfe** — nichts wird stillschweigend gebucht oder versendet.
