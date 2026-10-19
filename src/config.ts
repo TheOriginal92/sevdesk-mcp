@@ -1,3 +1,5 @@
+import { delimiter, isAbsolute } from "node:path";
+
 /** Runtime configuration, read once at startup from the environment. */
 
 export interface Config {
@@ -37,6 +39,46 @@ function rate(value: string | undefined, fallback: number): number {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+/**
+ * The token travels as a header, so the base URL must be https. Plain http is
+ * allowed for loopback only, so local proxies and test servers keep working.
+ */
+function parseBaseUrl(raw: string): string {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`SEVDESK_BASE_URL is not a valid URL: ${raw}`);
+  }
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname))) {
+    throw new Error(
+      `SEVDESK_BASE_URL must use https:// (got ${url.protocol}//${url.host}) — the API token is ` +
+        "sent as a header and must not travel in cleartext. http:// is only accepted for " +
+        "localhost, 127.0.0.1 and [::1].",
+    );
+  }
+  return raw.replace(/\/+$/, "");
+}
+
+/** Split on the platform delimiter (":" or ";" on Windows) and refuse relative entries. */
+function parseReceiptDirs(raw: string | undefined): string[] {
+  const dirs = (raw ?? "")
+    .split(delimiter)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const d of dirs) {
+    if (!isAbsolute(d)) {
+      throw new Error(
+        `SEVDESK_RECEIPT_DIRS entry '${d}' is not an absolute path — a relative entry would ` +
+          "resolve against whatever directory the MCP client launched this server in.",
+      );
+    }
+  }
+  return dirs;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const apiToken = env.SEVDESK_API_TOKEN?.trim();
   if (!apiToken) {
@@ -49,17 +91,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   return {
     apiToken,
-    baseUrl: (env.SEVDESK_BASE_URL ?? "https://my.sevdesk.de/api/v1").replace(/\/+$/, ""),
+    baseUrl: parseBaseUrl(env.SEVDESK_BASE_URL ?? "https://my.sevdesk.de/api/v1"),
     readOnly: bool(env.SEVDESK_READ_ONLY, false),
     dryRun: bool(env.SEVDESK_DRY_RUN, false),
     requestTimeoutMs: int(env.SEVDESK_TIMEOUT_MS, 30_000),
     maxRetries: int(env.SEVDESK_MAX_RETRIES, 3),
     rateLimitPerSec: rate(env.SEVDESK_RATE_LIMIT, 4),
     debug: bool(env.SEVDESK_DEBUG, false),
-    allowedReceiptDirs: (env.SEVDESK_RECEIPT_DIRS ?? "")
-      .split(":")
-      .map((s) => s.trim())
-      .filter(Boolean),
+    allowedReceiptDirs: parseReceiptDirs(env.SEVDESK_RECEIPT_DIRS),
   };
 }
 

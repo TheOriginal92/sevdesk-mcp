@@ -137,6 +137,12 @@ export class SevdeskClient {
       if (value === undefined || value === null || value === "") {
         throw new Error(`Missing required path parameter '${name}' for ${path}`);
       }
+      // encodeURIComponent leaves "." and ".." alone and the URL parser then
+      // collapses them (`/Voucher/..` -> `/api/v1/`), retargeting the request.
+      const text = String(value);
+      if (text === "." || text === "..") {
+        throw new Error(`Refused: path parameter '${name}' must not be '${text}'.`);
+      }
       return encodeURIComponent(String(value));
     });
   }
@@ -145,6 +151,13 @@ export class SevdeskClient {
     const mutating = opts.mutating ?? opts.method.toUpperCase() !== "GET";
     if (mutating && this.config.readOnly) {
       throw new ReadOnlyError(`${opts.method} ${opts.path}`);
+    }
+
+    const verb = opts.method.toUpperCase();
+    if ((verb === "GET" || verb === "HEAD") && (opts.body !== undefined || opts.form)) {
+      // fetch would throw a TypeError, which the loop below would mistake for
+      // a network error and retry with backoff.
+      throw new Error(`Refused: ${verb} ${opts.path} cannot carry a request body.`);
     }
 
     const qs = opts.query ? encodeQuery(opts.query) : "";
@@ -173,6 +186,9 @@ export class SevdeskClient {
           method: opts.method.toUpperCase(),
           headers,
           body: payload,
+          // Never follow: a redirect would replay the request (a write, with
+          // the token header) against a URL nobody configured.
+          redirect: "manual",
           signal: AbortSignal.timeout(this.config.requestTimeoutMs),
         });
       } catch (err) {
@@ -196,6 +212,18 @@ export class SevdeskClient {
       }
 
       this.log(opts.method, opts.path, String(res.status));
+
+      if (res.status >= 300 && res.status < 400) {
+        await this.drain(res);
+        throw new SevdeskApiError(
+          res.status,
+          opts.method,
+          opts.path,
+          "sevDesk answered with a redirect. This server does not follow redirects, because " +
+            "a followed redirect would replay the request to a URL nobody configured. " +
+            "Check SEVDESK_BASE_URL.",
+        );
+      }
 
       // 429 is always safe to retry: a throttled call was never executed.
       if (res.status === 429 && attempt < this.config.maxRetries) {
