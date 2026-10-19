@@ -21,7 +21,7 @@ export function capOutput(text: string): string {
   );
 }
 
-export const VERSION = "0.4.0";
+export const VERSION = "0.5.0";
 
 /** Every tool the server exposes, in listing order. */
 export const tools: ToolDef[] = [...resourceTools, ...auditTools, ...discoveryTools];
