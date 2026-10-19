@@ -10,6 +10,7 @@ import { loadConfig } from "../src/config.js";
 import {
   assertAllowedPath,
   optLimit,
+  optRange,
   requireId,
   type ToolContext,
 } from "../src/lib/tool.js";
@@ -464,7 +465,7 @@ describe("audit argument bounds and diff truncation", () => {
   it("diff_receipt_folder flags a hit voucher cap, and refuses non-string extensions", async () => {
     const dir = await mkdtemp(join(tmpdir(), "sevdesk-mcp-diff-"));
     await writeFile(join(dir, "a.pdf"), "x");
-    const rows = Array.from({ length: 3 }, (_, i) => ({ id: String(i), voucherDate: "2026-06-01", status: "100" }));
+    const rows = Array.from({ length: 4 }, (_, i) => ({ id: String(i), voucherDate: "2026-06-01", status: "100" }));
     const ctx = {
       client: { getAll: async (_p: string, _q: unknown, o: { maxItems: number }) => rows.slice(0, o.maxItems) },
       config: { allowedReceiptDirs: [dir] },
@@ -475,6 +476,78 @@ describe("audit argument bounds and diff truncation", () => {
     expect(String(hit.warning)).toMatch(/maxVouchers/);
     const ok = (await diff.handler({ directory: dir, maxVouchers: 5 }, ctx)) as Row;
     expect(ok.truncated).toBe(false);
+    // exactly at the cap is not truncation
+    const exact = (await diff.handler({ directory: dir, maxVouchers: 4 }, ctx)) as Row;
+    expect(exact.truncated).toBe(false);
     await expect(diff.handler({ directory: dir, extensions: [1] }, ctx)).rejects.toThrow(/extensions must be/);
+  });
+});
+
+describe("round 4", () => {
+  const rowsCtx = (n: number, extra: Row = {}) =>
+    ({
+      client: {
+        getAll: async (_p: string, _q: unknown, o: { maxItems: number }) =>
+          Array.from({ length: Math.min(n, o.maxItems) }, (_, i) => ({
+            id: String(i), voucherDate: "2026-06-01", sumGross: 10 + i, supplierName: "S" + i,
+            status: "100", creditDebit: "C", ...extra,
+          })),
+        request: async () => ({ status: 200, data: { objects: [] } }),
+      },
+      config: {},
+    }) as unknown as ToolContext;
+
+  it("every voucher-fetching audit flags truncation, but not an exact fit", async () => {
+    for (const name of [
+      "sevdesk_audit_vat",
+      "sevdesk_reverse_charge_report",
+      "sevdesk_find_duplicates",
+      "sevdesk_subscription_gaps",
+      "sevdesk_reconcile_transactions",
+    ]) {
+      const t = tools.find((x) => x.name === name);
+      if (!t) continue;
+      const a = name === "sevdesk_reconcile_transactions" ? { maxItems: 3 } : { maxVouchers: 3 };
+      const cut = JSON.stringify(await t.handler({ ...a, includePositions: false }, rowsCtx(10)));
+      expect(cut, name).toMatch(/"truncated": ?true/);
+      expect(cut, name).toMatch(/maxVouchers|raise|Raise/);
+      const exact = JSON.stringify(await t.handler({ ...a, includePositions: false }, rowsCtx(3)));
+      expect(exact, name).toMatch(/"truncated": ?false/);
+    }
+  });
+
+  it("builds the base URL from the parsed URL", () => {
+    for (const u of ["https://my.sevdesk.de/api/v1?", "https://my.sevdesk.de/api/v1#", "  https://my.sevdesk.de/api/v1/  "]) {
+      expect(loadConfig(env({ SEVDESK_BASE_URL: u })).baseUrl).toBe("https://my.sevdesk.de/api/v1");
+    }
+  });
+
+  it("refuses fileName in extra, accepts numeric taxRuleId, falls back on bad PDF names", async () => {
+    const c = { client: {}, config: { readOnly: false, dryRun: true } } as unknown as ToolContext;
+    const v = { supplierName: "A", voucherDate: "01.09.2026", positions: [{ sumNet: 1, taxRate: 0 }] };
+    await expect(
+      tool("sevdesk_create_voucher").handler({ ...v, taxRuleId: "9", extra: { filename: "x.pdf" } }, c),
+    ).rejects.toThrow(/fileName/);
+    const out = (await tool("sevdesk_create_voucher").handler({ ...v, taxRuleId: 9 }, c)) as {
+      wouldSend: { body: { voucher: { taxRule: { id: string } } } };
+    };
+    expect(out.wouldSend.body.voucher.taxRule.id).toBe("9");
+    await expect(
+      tool("sevdesk_create_invoice").handler({ contactId: 1, taxRuleId: 1, positions: [{ name: "x", price: 1 }] }, c),
+    ).resolves.toMatchObject({ dryRun: true });
+
+    const dir = await mkdtemp(join(tmpdir(), "sevdesk-mcp-pdfname-"));
+    const pc = {
+      client: { request: async () => ({ status: 200, data: { content: Buffer.from("x").toString("base64"), filename: ".." } }) },
+      config: { readOnly: false, dryRun: false, allowedReceiptDirs: [dir] },
+    } as unknown as ToolContext;
+    const saved = (await tool("sevdesk_get_invoice_pdf").handler({ invoiceId: 7, directory: dir }, pc)) as { saved: string };
+    expect(saved.saved).toMatch(/invoice-7\.pdf$/);
+  });
+
+  it("floors integer audit args but keeps rate fractional", () => {
+    expect(optRange({ x: 2.9 }, "x", 1, 0, 10, true)).toBe(2);
+    expect(optRange({ x: 2.9 }, "x", 1, 0, 10)).toBe(2.9);
+    expect(optRange({ x: 99 }, "x", 1, 0, 10)).toBe(10);
   });
 });

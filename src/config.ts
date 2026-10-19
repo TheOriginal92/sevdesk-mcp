@@ -65,7 +65,8 @@ function parseBaseUrl(raw: string): string {
         "the token goes in SEVDESK_API_TOKEN, and paths are appended to the base.",
     );
   }
-  return raw.replace(/\/+$/, "");
+  // Rebuilt from the parsed URL so a bare "?" / "#" or stray whitespace cannot leak into requests.
+  return (url.origin + url.pathname).replace(/\/+$/, "");
 }
 
 /** Split on the platform delimiter (":" or ";" on Windows) and refuse relative entries. */

@@ -14,6 +14,7 @@ import {
   ymd,
 } from "../lib/vat.js";
 import {
+  assertAllowedDir,
   assertAllowedPath,
   bool,
   int,
@@ -22,6 +23,7 @@ import {
   obj,
   optId,
   optLimit,
+  optRuleId,
   optString,
   positionObjects,
   requireId,
@@ -610,7 +612,7 @@ const createVoucher: ToolDef = {
       throw new Error(`creditDebit must be "C" or "D", not "${cdRaw}".`);
     }
     const creditDebit = cdRaw ?? "C";
-    const taxRuleId = optString(args, "taxRuleId");
+    const taxRuleId = optRuleId(args);
     if (!taxRuleId) {
       throw new Error(
         "taxRuleId is required: the server does not guess a tax treatment. " +
@@ -648,6 +650,9 @@ const createVoucher: ToolDef = {
     }
     const extra = (args.extra ?? {}) as Row;
     // taxType / taxSet are legacy tax fields that would contradict taxRule.
+    if ("fileName" in extra || "filename" in extra) {
+      throw new Error("Refused: pass the receipt via the top-level fileName argument, not extra.");
+    }
     const collisions = Object.keys(extra).filter(
       (k) => base[k] !== undefined || k === "taxType" || k === "taxSet",
     );
@@ -816,7 +821,7 @@ const setTaxRule: ToolDef = {
   },
   async handler(args, ctx) {
     const id = requireId(args, "voucherId");
-    const target = requireString(args, "taxRuleId") as TaxRuleId;
+    const target = (optRuleId(args) ?? requireString(args, "taxRuleId")) as TaxRuleId;
     if (!VOUCHER_RULE_IDS.includes(target)) {
       throw new Error(
         `taxRule '${target}' cannot be used on vouchers. Usable rules: ${VOUCHER_RULE_IDS.join(", ")}.`,
@@ -922,7 +927,7 @@ const createInvoice: ToolDef = {
     const positions = positionObjects(args);
     if (positions.length === 0) throw new Error("At least one position is required.");
 
-    const ruleId = optString(args, "taxRuleId");
+    const ruleId = optRuleId(args);
     if (!ruleId) {
       throw new Error(
         "taxRuleId is required: the server does not guess a tax treatment. " +
@@ -1038,9 +1043,8 @@ const getInvoicePdf: ToolDef = {
   },
   async handler(args, ctx) {
     const id = requireId(args, "invoiceId");
-    const dir = await assertAllowedPath(ctx, requireString(args, "directory"));
-    // Fail before the network call: a PDF fetched and then unwritable is a wasted (and, for sevDesk, logged) request.
-    if (!(await stat(dir).catch(() => null))?.isDirectory()) throw new Error(`Not a directory: ${dir}`);
+    // Checked before the network call: no point fetching a PDF we cannot write.
+    const dir = await assertAllowedDir(ctx, requireString(args, "directory"));
 
     const { data } = await ctx.client.request<Row>({
       method: "GET",
@@ -1060,7 +1064,8 @@ const getInvoicePdf: ToolDef = {
     }
     // The filename comes from the API — keep only its basename so it cannot
     // point outside the allowlisted directory.
-    const filename = basename(String(meta?.filename ?? `invoice-${id}.pdf`));
+    let filename = basename(String(meta?.filename ?? ""));
+    if (filename === "" || filename === "." || filename === "..") filename = `invoice-${id}.pdf`;
     const target = join(dir, filename);
     const bytes = Buffer.from(content, "base64");
     // flag wx: never clobber an existing file in the user's receipt archive.

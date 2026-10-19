@@ -1,4 +1,4 @@
-import { realpath } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { delimiter, isAbsolute, resolve, sep } from "node:path";
 
 import type { SevdeskClient } from "../client.js";
@@ -78,6 +78,13 @@ export async function assertAllowedPath(ctx: ToolContext, filePath: string): Pro
   return target;
 }
 
+/** {@link assertAllowedPath} for callers that need an existing directory. */
+export async function assertAllowedDir(ctx: ToolContext, dirPath: string): Promise<string> {
+  const real = await assertAllowedPath(ctx, dirPath);
+  if (!(await stat(real).catch(() => null))?.isDirectory()) throw new Error(`Not a directory: ${real}`);
+  return real;
+}
+
 export const str = (description: string, extra: Record<string, JsonValue> = {}) => ({
   type: "string",
   description,
@@ -135,12 +142,6 @@ export function optBool(args: Record<string, unknown>, key: string): boolean | u
   return undefined;
 }
 
-/** A number argument clamped to [min, max]; absent or non-numeric falls back to the default. */
-export function optRange(args: Record<string, unknown>, key: string, fallback: number, min: number, max: number): number {
-  const n = optNumber(args, key);
-  return Math.min(max, Math.max(min, n ?? fallback));
-}
-
 export function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -176,12 +177,34 @@ export function optId(args: Record<string, unknown>, key: string): string | unde
 }
 
 /**
- * A result-size argument: floored to an integer and clamped to [1, max], so
- * `-1` or `1e9` cannot slice off the wrong rows or walk the whole ledger.
- * Non-numeric input falls back to the default.
+ * A number argument clamped to [min, max]; absent or non-numeric falls back to
+ * the (clamped) default. With `integer`, fractions are floored first.
+ */
+export function optRange(
+  args: Record<string, unknown>,
+  key: string,
+  fallback: number,
+  min: number,
+  max: number,
+  integer = false,
+): number {
+  let n = optNumber(args, key) ?? fallback;
+  if (integer) n = Math.floor(n);
+  return Math.min(max, Math.max(min, n));
+}
+
+/**
+ * A result-size argument: floored and clamped to [1, max], so `-1` or `1e9`
+ * cannot slice off the wrong rows or walk the whole ledger.
  */
 export function optLimit(args: Record<string, unknown>, key: string, fallback: number, max: number): number {
-  const n = optNumber(args, key);
-  if (n === undefined) return Math.min(fallback, max);
-  return Math.min(max, Math.max(1, Math.floor(n)));
+  return optRange(args, key, fallback, 1, max, true);
 }
+
+/** A tax rule id given as a string or a whole number (models often send 12 instead of "12"). */
+export function optRuleId(args: Record<string, unknown>, key = "taxRuleId"): string | undefined {
+  const v = args[key];
+  if (typeof v === "number" && Number.isSafeInteger(v) && v >= 0) return String(v);
+  return optString(args, key);
+}
+

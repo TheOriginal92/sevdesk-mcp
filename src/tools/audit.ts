@@ -1,4 +1,4 @@
-import { readdir, stat } from "node:fs/promises";
+import { readdir } from "node:fs/promises";
 import { basename, extname, resolve } from "node:path";
 
 import {
@@ -17,7 +17,7 @@ import {
   ymd,
 } from "../lib/vat.js";
 import {
-  assertAllowedPath,
+  assertAllowedDir,
   bool,
   int,
   optBool,
@@ -102,16 +102,20 @@ async function fetchVouchersCapped(
   maxItems: number,
 ): Promise<{ vouchers: Row[]; truncated: boolean }> {
   const query: Record<string, unknown> = { embed: "supplier,taxRule" };
-  const all = await ctx.client.getAll<Row>("/Voucher", query, { maxItems });
+  // One extra row tells "exactly at the cap" from "more behind it".
+  const all = await ctx.client.getAll<Row>("/Voucher", query, { maxItems: maxItems + 1 });
   return {
-    vouchers: all.filter((v) => inPeriod(parseSevdeskDate(v.voucherDate), period)),
-    // getAll stops at the cap, so a full result may be hiding more.
-    truncated: all.length >= maxItems,
+    vouchers: all.slice(0, maxItems).filter((v) => inPeriod(parseSevdeskDate(v.voucherDate), period)),
+    truncated: all.length > maxItems,
   };
 }
 
-async function fetchVouchers(ctx: ToolContext, period: PeriodArgs, maxItems: number): Promise<Row[]> {
-  return (await fetchVouchersCapped(ctx, period, maxItems)).vouchers;
+/** The cap applies to the ledger before the date filter, so the period itself may be incomplete. */
+function truncationWarning(maxItems: number): string {
+  return (
+    `Only the first ${maxItems} vouchers of the ledger were scanned, before the date filter was applied, ` +
+    "so vouchers in the period may be missing. Raise maxVouchers."
+  );
 }
 
 async function fetchPositions(
@@ -272,7 +276,8 @@ const auditVat: ToolDef = {
   async handler(args, ctx) {
     const period = readPeriod(args);
     const withPositions = optBool(args, "includePositions") ?? true;
-    const vouchers = await fetchVouchers(ctx, period, optLimit(args, "maxVouchers", 2000, 20_000));
+    const maxVouchers = optLimit(args, "maxVouchers", 2000, 20_000);
+    const { vouchers, truncated } = await fetchVouchersCapped(ctx, period, maxVouchers);
     const sides = new Set<VoucherSide>(vouchers.map((v) => voucherSide(v) ?? "expense"));
 
     // Positions, contacts and guidance depend only on the voucher list — fetch
@@ -287,6 +292,7 @@ const auditVat: ToolDef = {
     const { positions } = posResult;
     const { countries } = contactResult;
     const warnings = [...posResult.warnings, ...contactResult.warnings, ...guidance.warnings];
+    if (truncated) warnings.push(truncationWarning(maxVouchers));
 
     const findings: Finding[] = [];
 
@@ -518,6 +524,7 @@ const auditVat: ToolDef = {
       period: periodLabel(period),
       vouchersExamined: vouchers.length,
       positionsFetched: withPositions,
+      truncated,
       warnings,
       findingCount: findings.length,
       byCode: counts,
@@ -569,10 +576,12 @@ const reverseChargeReport: ToolDef = {
   async handler(args, ctx) {
     const period = readPeriod(args);
     const rate = optRange(args, "rate", 19, 0, 100);
-    const [vouchers, { countries, warnings }] = await Promise.all([
-      fetchVouchers(ctx, period, optLimit(args, "maxVouchers", 2000, 20_000)),
+    const maxVouchers = optLimit(args, "maxVouchers", 2000, 20_000);
+    const [{ vouchers, truncated }, { countries, warnings }] = await Promise.all([
+      fetchVouchersCapped(ctx, period, maxVouchers),
       fetchSupplierCountries(ctx),
     ]);
+    if (truncated) warnings.push(truncationWarning(maxVouchers));
 
     const deductible: Row[] = [];
     const nonDeductible: Row[] = [];
@@ -611,6 +620,7 @@ const reverseChargeReport: ToolDef = {
     return {
       period: periodLabel(period),
       rateApplied: rate,
+      truncated,
       warnings,
       reverseChargeExpenses: {
         deductible: {
@@ -685,8 +695,9 @@ const findDuplicates: ToolDef = {
   },
   async handler(args, ctx) {
     const period = readPeriod(args);
-    const dayWindow = optRange(args, "dayWindow", 7, 0, 366);
-    const vouchers = await fetchVouchers(ctx, period, optLimit(args, "maxVouchers", 2000, 20_000));
+    const dayWindow = optRange(args, "dayWindow", 7, 0, 366, true);
+    const maxVouchers = optLimit(args, "maxVouchers", 2000, 20_000);
+    const { vouchers, truncated } = await fetchVouchersCapped(ctx, period, maxVouchers);
 
     const byNumber = new Map<string, Row[]>();
     for (const v of vouchers) {
@@ -745,6 +756,7 @@ const findDuplicates: ToolDef = {
 
     return {
       vouchersExamined: vouchers.length,
+      ...(truncated ? { truncated, warning: truncationWarning(maxVouchers) } : { truncated }),
       duplicateDocumentNumbers: sameNumber,
       sameSupplierSameAmount: sameAmount,
       notYetBooked: unfinished,
@@ -779,8 +791,9 @@ const subscriptionGaps: ToolDef = {
   },
   async handler(args, ctx) {
     const period = readPeriod(args);
-    const minMonths = optRange(args, "minMonths", 3, 1, 120);
-    const vouchers = await fetchVouchers(ctx, period, optLimit(args, "maxVouchers", 2000, 20_000));
+    const minMonths = optRange(args, "minMonths", 3, 1, 120, true);
+    const maxVouchers = optLimit(args, "maxVouchers", 2000, 20_000);
+    const { vouchers, truncated } = await fetchVouchersCapped(ctx, period, maxVouchers);
 
     const bySupplier = new Map<string, { name: string; months: Map<string, number> }>();
     for (const v of vouchers) {
@@ -830,6 +843,7 @@ const subscriptionGaps: ToolDef = {
     return {
       period: periodLabel(period),
       monthsCovered: allMonths,
+      ...(truncated ? { truncated, warning: truncationWarning(maxVouchers) } : { truncated }),
       recurringSuppliersWithGaps: results.length,
       estimatedTotalMissing: round2(results.reduce((s, r) => s + num(r.estimatedMissingValue), 0)),
       results,
@@ -905,10 +919,7 @@ const diffReceiptFolder: ToolDef = {
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const target = await assertAllowedPath(ctx, requireString(args, "directory"));
-
-    const info = await stat(target).catch(() => null);
-    if (!info?.isDirectory()) throw new Error(`Not a directory: ${target}`);
+    const target = await assertAllowedDir(ctx, requireString(args, "directory"));
 
     const rawExts: unknown[] = Array.isArray(args.extensions) ? args.extensions : [".pdf"];
     if (!rawExts.every((e): e is string => typeof e === "string" && e.trim() !== "")) {
@@ -937,7 +948,7 @@ const diffReceiptFolder: ToolDef = {
 
     const parsed = files.map((f) => parseReceiptFilename(f));
     const period = readPeriod(args);
-    const tolerance = optRange(args, "dayTolerance", 5, 0, 366) * DAY_MS;
+    const tolerance = optRange(args, "dayTolerance", 5, 0, 366, true) * DAY_MS;
     const maxVouchers = optLimit(args, "maxVouchers", 2000, 20_000);
     // A hidden voucher would be reported below as "has no file".
     const { vouchers, truncated } = await fetchVouchersCapped(ctx, period, maxVouchers);
@@ -1038,13 +1049,15 @@ const reconcileTransactions: ToolDef = {
   },
   async handler(args, ctx) {
     const period = readPeriod(args);
-    const window = optRange(args, "dayWindow", 5, 0, 366);
+    const window = optRange(args, "dayWindow", 5, 0, 366, true);
     const maxItems = optLimit(args, "maxItems", 2000, 20_000);
 
-    const [transactions, vouchers] = await Promise.all([
-      ctx.client.getAll<Row>("/CheckAccountTransaction", {}, { maxItems }),
-      fetchVouchers(ctx, period, maxItems),
+    const [allTransactions, { vouchers, truncated: vouchersTruncated }] = await Promise.all([
+      ctx.client.getAll<Row>("/CheckAccountTransaction", {}, { maxItems: maxItems + 1 }),
+      fetchVouchersCapped(ctx, period, maxItems),
     ]);
+    const transactions = allTransactions.slice(0, maxItems);
+    const truncated = vouchersTruncated || allTransactions.length > maxItems;
     const txs = transactions.filter((t) => inPeriod(parseSevdeskDate(t.valueDate), period));
 
     const candidates = vouchers.map((v) => ({
@@ -1093,6 +1106,7 @@ const reconcileTransactions: ToolDef = {
       period: periodLabel(period),
       transactionsExamined: txs.length,
       vouchersExamined: vouchers.length,
+      ...(truncated ? { truncated, warning: truncationWarning(maxItems) } : { truncated }),
       matched,
       unmatchedTransactions,
       vouchersWithoutPayment,

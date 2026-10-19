@@ -75,6 +75,14 @@ Behaviour changes that can break existing callers are marked **(breaking)**.
 - `sevdesk_call`: a write keeps `body: {}` as sent; on a GET `null`, `{}` and
   `[]` count as no body. `extra` and each `positions` entry must be objects.
   `sevdesk_get_invoice_pdf` checks the target directory before fetching.
+- Every audit that fetches vouchers (and `sevdesk_reconcile_transactions` for
+  transactions) reports `truncated` and a warning when `maxVouchers` /
+  `maxItems` cut the ledger before the date filter; an exact fit is not flagged.
+- `sevdesk_create_voucher` refuses `fileName`/`filename` in `extra`;
+  `taxRuleId` may be given as a number. `sevdesk_get_invoice_pdf` falls back to
+  `invoice-<id>.pdf` for an empty or dot-only API filename. The base URL is
+  rebuilt from the parsed URL (a bare `?`/`#` is dropped).
+- Release workflow verifies the pinned `mcp-publisher` checksum before `npm publish`.
 - Tool output is capped at 200,000 characters, with a closing line saying how
   much was cut.
 
