@@ -5,6 +5,18 @@ import { auditTools } from "./tools/audit.js";
 import { discoveryTools } from "./tools/discovery.js";
 import { resourceTools } from "./tools/resources.js";
 
+/** Longest tool result passed to the model; a list endpoint can return megabytes. */
+export const MAX_OUTPUT_CHARS = 200_000;
+
+export function capOutput(text: string): string {
+  if (text.length <= MAX_OUTPUT_CHARS) return text;
+  return (
+    text.slice(0, MAX_OUTPUT_CHARS) +
+    `\n\n[Output truncated at ${MAX_OUTPUT_CHARS} of ${text.length} characters. ` +
+    "Narrow the request: a smaller limit/offset, a date range or filters.]"
+  );
+}
+
 export const VERSION = "0.4.0";
 
 /** Every tool the server exposes, in listing order. */
@@ -53,11 +65,12 @@ export function buildServer(ctx: ToolContext): Server {
             ? " ⚠️ This tool can change data in sevDesk."
             : ""),
         inputSchema: t.inputSchema,
-        // Standard MCP hints so clients can shape confirmation UX. Writes are
-        // never destructive here: they create drafts or flip reversible flags.
+        // Standard MCP hints so clients can shape confirmation UX. The curated
+        // writes create drafts or flip reversible flags; only tools that can
+        // delete (sevdesk_call) declare themselves destructive.
         annotations: {
           readOnlyHint: !t.mutating,
-          destructiveHint: false,
+          destructiveHint: t.destructive === true,
           openWorldHint: true,
         },
       })),
@@ -90,8 +103,9 @@ export function buildServer(ctx: ToolContext): Server {
 
     try {
       const result = await tool.handler((rawArgs ?? {}) as Record<string, unknown>, ctx);
-      const text =
-        typeof result === "string" ? result : JSON.stringify(result, null, 2);
+      const text = capOutput(
+        typeof result === "string" ? result : (JSON.stringify(result, null, 2) ?? ""),
+      );
       return { content: [{ type: "text" as const, text }] };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

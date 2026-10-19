@@ -7,7 +7,7 @@ import {
 } from "../catalog.js";
 import { SevdeskClient } from "../client.js";
 import { ReadOnlyError } from "../config.js";
-import { bool, isDryRun, obj, optNumber, optString, requireString, str, type ToolDef } from "../lib/tool.js";
+import { bool, isDryRun, obj, optBool, optLimit, optString, requireString, str, type ToolDef } from "../lib/tool.js";
 
 /**
  * Three tools that together expose the *entire* sevDesk API.
@@ -46,7 +46,7 @@ const listOperations: ToolDef = {
       query: optString(args, "query"),
       tag: optString(args, "tag"),
       kind,
-      limit: optNumber(args, "limit") ?? 60,
+      limit: optLimit(args, "limit", 60, 200),
     });
     if (ops.length === 0) {
       return {
@@ -97,8 +97,11 @@ const callOperation: ToolDef = {
     "by name; remaining `params` entries become query parameters. Nested objects are " +
     "encoded in sevDesk's bracket syntax (a[b]=c). Mutating operations are refused when " +
     "the server runs with SEVDESK_READ_ONLY=true, and are only described (not sent) when " +
-    "SEVDESK_DRY_RUN=true or `dryRun` is passed.",
-  mutating: true, // conservatively declared; the handler checks per operation
+    "SEVDESK_DRY_RUN=true or `dryRun` is passed. Operations with a `preventSendBy` query " +
+    "parameter (the *GetPdf reads) default it to true so a read does not mark the document as sent. " +
+    "Can call DELETE operations, which are irreversible.",
+  mutating: true,
+  destructive: true, // conservatively declared; the handler checks per operation
   listInReadOnly: true, // covers reads too — writes are refused per call below
   inputSchema: {
     type: "object",
@@ -139,10 +142,39 @@ const callOperation: ToolDef = {
       );
     }
 
+    // Every path parameter in the sevDesk spec is an id. Anything but digits
+    // could retarget the request ("..", "1/../x", "1?x").
+    for (const p of op.params) {
+      if (p.in !== "path") continue;
+      const v = params[p.name];
+      const numeric = p.type === "integer" || p.type === "number";
+      if (numeric && !(typeof v === "number" ? Number.isSafeInteger(v) && v >= 0 : /^\d+$/.test(String(v)))) {
+        throw new Error(`Refused: path parameter '${p.name}' of ${op.operationId} must be a numeric id.`);
+      }
+    }
+
+    if (body !== undefined && !op.mutating) {
+      throw new Error(`Refused: ${op.operationId} is a ${op.method} operation and takes no request body.`);
+    }
+
     const filledPath = SevdeskClient.fillPath(op.path, params);
     const query: Record<string, unknown> = {};
     for (const [k, v] of Object.entries(params)) {
       if (!pathParamNames.has(k)) query[k] = v;
+    }
+
+    // Some GETs change state: the *GetPdf operations mark the document as sent
+    // unless preventSendBy is true. A read must stay a read, so default it on,
+    // and refuse turning it off while the server is read-only.
+    if (op.params.some((p) => p.in === "query" && p.name === "preventSendBy")) {
+      if (query.preventSendBy === undefined) {
+        query.preventSendBy = true;
+      } else if (ctx.config.readOnly && optBool(query, "preventSendBy") !== true) {
+        throw new Error(
+          `Refused: ${op.operationId} with preventSendBy=false marks the document as sent, but the ` +
+            "server runs with SEVDESK_READ_ONLY=true. Unset that variable to allow it.",
+        );
+      }
     }
 
     if (isDryRun(args, ctx) && op.mutating) {

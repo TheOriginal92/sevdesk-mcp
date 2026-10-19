@@ -1,4 +1,5 @@
-import { isAbsolute, resolve, sep } from "node:path";
+import { realpath } from "node:fs/promises";
+import { delimiter, isAbsolute, resolve, sep } from "node:path";
 
 import type { SevdeskClient } from "../client.js";
 import type { Config } from "../config.js";
@@ -35,6 +36,8 @@ export interface ToolDef {
    * covers reads; its writes are still refused at the client layer).
    */
   listInReadOnly?: boolean;
+  /** Irreversible writes (deletes) — sets the MCP destructiveHint. */
+  destructive?: boolean;
   handler: (args: Record<string, unknown>, ctx: ToolContext) => Promise<unknown>;
 }
 
@@ -46,18 +49,29 @@ export function isDryRun(args: Record<string, unknown>, ctx: ToolContext): boole
 /**
  * Enforce the SEVDESK_RECEIPT_DIRS allowlist. Filesystem access is disabled
  * until the user names directories explicitly; paths outside them are refused.
+ * Containment is checked on real paths, so a symlink inside an allowlisted
+ * directory cannot lead out of it. The target must exist (every caller reads
+ * a file or directory); the real path is returned and must be used for I/O.
  */
-export function assertAllowedPath(ctx: ToolContext, filePath: string): string {
+export async function assertAllowedPath(ctx: ToolContext, filePath: string): Promise<string> {
   if (!isAbsolute(filePath)) throw new Error("File path must be absolute.");
-  const target = resolve(filePath);
   const allow = ctx.config.allowedReceiptDirs;
   if (allow.length === 0) {
     throw new Error(
-      "Refused: filesystem access is disabled by default. Set SEVDESK_RECEIPT_DIRS to a " +
-        "colon-separated allowlist of directories to enable the receipt file tools.",
+      "Refused: filesystem access is disabled by default. Set SEVDESK_RECEIPT_DIRS to an " +
+        `allowlist of absolute directories (separated by '${delimiter}') to enable the receipt file tools.`,
     );
   }
-  const ok = allow.some((a) => target === resolve(a) || target.startsWith(resolve(a) + sep));
+  let target: string;
+  try {
+    target = await realpath(resolve(filePath));
+  } catch {
+    throw new Error(`Not found: ${resolve(filePath)}`);
+  }
+  const roots = (
+    await Promise.all(allow.map((a) => realpath(resolve(a)).catch(() => null)))
+  ).filter((r): r is string => r !== null);
+  const ok = roots.some((r) => target === r || target.startsWith(r.endsWith(sep) ? r : r + sep));
   if (!ok) {
     throw new Error(`Refused: ${target} is outside SEVDESK_RECEIPT_DIRS (${allow.join(", ")}).`);
   }
@@ -119,4 +133,36 @@ export function optBool(args: Record<string, unknown>, key: string): boolean | u
     if (["false", "0", "no"].includes(v.toLowerCase())) return false;
   }
   return undefined;
+}
+
+const ID_PATTERN = /^\d+$/;
+
+/**
+ * A sevDesk id as a string: a non-negative integer or a digit-only string.
+ * Ids end up in URL paths and object references, so nothing else gets through.
+ */
+export function requireId(args: Record<string, unknown>, key: string): string {
+  const id = optId(args, key);
+  if (id === undefined) throw new Error(`${key} must be a numeric id.`);
+  return id;
+}
+
+/** Like {@link requireId} but absent/empty is fine; present-and-malformed is refused. */
+export function optId(args: Record<string, unknown>, key: string): string | undefined {
+  const v = args[key];
+  if (v === undefined || v === null || v === "") return undefined;
+  if (typeof v === "number" && Number.isSafeInteger(v) && v >= 0) return String(v);
+  if (typeof v === "string" && ID_PATTERN.test(v.trim())) return v.trim();
+  throw new Error(`${key} must be a numeric id.`);
+}
+
+/**
+ * A result-size argument: floored to an integer and clamped to [1, max], so
+ * `-1` or `1e9` cannot slice off the wrong rows or walk the whole ledger.
+ * Non-numeric input falls back to the default.
+ */
+export function optLimit(args: Record<string, unknown>, key: string, fallback: number, max: number): number {
+  const n = optNumber(args, key);
+  if (n === undefined) return Math.min(fallback, max);
+  return Math.min(max, Math.max(1, Math.floor(n)));
 }

@@ -1,5 +1,5 @@
 import { readFile, stat, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { basename, extname, join } from "node:path";
 
 import {
   INVOICE_STATUS,
@@ -19,8 +19,10 @@ import {
   int,
   isDryRun,
   obj,
-  optNumber,
+  optId,
+  optLimit,
   optString,
+  requireId,
   requireString,
   str,
   type ToolContext,
@@ -128,7 +130,7 @@ const listVouchers: ToolDef = {
     const p = period(args);
     const supplier = optString(args, "supplier")?.toLowerCase();
     const wanted = optString(args, "status");
-    const limit = optNumber(args, "limit") ?? 200;
+    const limit = optLimit(args, "limit", 200, 1000);
 
     const all = await ctx.client.getAll<Row>("/Voucher", { embed: "supplier,taxRule" }, { maxItems: 2000 });
 
@@ -179,7 +181,7 @@ const getVoucher: ToolDef = {
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const id = requireString(args, "voucherId");
+    const id = requireId(args, "voucherId");
     const { data } = await ctx.client.request<{ objects?: Row[] }>({
       method: "GET",
       path: `/Voucher/${encodeURIComponent(id)}`,
@@ -240,7 +242,7 @@ const listInvoices: ToolDef = {
   },
   async handler(args, ctx) {
     const p = period(args);
-    const limit = optNumber(args, "limit") ?? 200;
+    const limit = optLimit(args, "limit", 200, 1000);
     const all = await ctx.client.getAll<Row>("/Invoice", { embed: "contact,taxRule" }, { maxItems: 2000 });
     const rows = all
       .filter((i) => within(parseSevdeskDate(i.invoiceDate), p))
@@ -301,7 +303,7 @@ const summarize: ToolDef = {
     const p = period(args);
     const groupBy = optString(args, "groupBy") ?? "month";
     const side = optString(args, "side") ?? "any";
-    const maxGroups = Math.max(1, optNumber(args, "maxGroups") ?? 40);
+    const maxGroups = optLimit(args, "maxGroups", 40, 1000);
 
     const MAX_ITEMS = 10_000;
     const rows =
@@ -411,7 +413,7 @@ const listContacts: ToolDef = {
   },
   async handler(args, ctx) {
     const search = optString(args, "search")?.toLowerCase();
-    const limit = optNumber(args, "limit") ?? 200;
+    const limit = optLimit(args, "limit", 200, 1000);
     const all = await ctx.client.getAll<Row>("/Contact", {}, { maxItems: 5000 });
     const rows = all
       .map((c) => ({
@@ -443,8 +445,8 @@ const listTransactions: ToolDef = {
   },
   async handler(args, ctx) {
     const p = period(args);
-    const accountId = optString(args, "checkAccountId");
-    const limit = optNumber(args, "limit") ?? 200;
+    const accountId = optId(args, "checkAccountId");
+    const limit = optLimit(args, "limit", 200, 1000);
     const query: Record<string, unknown> = {};
     if (accountId) {
       query["checkAccount[id]"] = accountId;
@@ -471,35 +473,47 @@ const listTransactions: ToolDef = {
 
 /* ---------------------------- writes ------------------------------ */
 
+const MIME_BY_EXT: Record<string, string> = {
+  ".pdf": "application/pdf",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".xml": "application/xml",
+};
+
 const uploadVoucherFile: ToolDef = {
   name: "sevdesk_upload_voucher_file",
   title: "Upload a receipt file to sevDesk",
   description:
-    "Upload a local PDF/image to sevDesk's temporary voucher storage and return the filename " +
+    "Upload a local PDF/image/XML e-invoice to sevDesk's temporary voucher storage and return the filename " +
     "token you pass to sevdesk_create_voucher. WRITE operation — refused under SEVDESK_READ_ONLY.",
   mutating: true,
   inputSchema: {
     type: "object",
     properties: {
       filePath: str("Absolute path to the receipt file on this machine."),
-      mimeType: str("Override the content type (default guessed from the extension)."),
+      mimeType: str("Content type; required for extensions other than .pdf, .png, .jpg, .jpeg, .xml."),
       dryRun: bool("Preview the request without sending it."),
     },
     required: ["filePath"],
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const path = assertAllowedPath(ctx, requireString(args, "filePath"));
+    const path = await assertAllowedPath(ctx, requireString(args, "filePath"));
     const info = await stat(path).catch(() => null);
     if (!info?.isFile()) throw new Error(`Not a file: ${path}`);
     if (info.size > 20 * 1024 * 1024) throw new Error("File is larger than 20 MB.");
 
-    const guessed = path.toLowerCase().endsWith(".pdf")
-      ? "application/pdf"
-      : path.toLowerCase().endsWith(".png")
-        ? "image/png"
-        : "image/jpeg";
+    // XML covers XRechnung / ZUGFeRD e-invoices. No fallback type: a wrong
+    // guess is stored as-is, so an unknown extension must be stated explicitly.
+    const guessed = MIME_BY_EXT[extname(path).toLowerCase()];
     const mime = optString(args, "mimeType") ?? guessed;
+    if (!mime) {
+      throw new Error(
+        `Refused: cannot tell the content type of '${basename(path)}'. Known extensions: ` +
+          `${Object.keys(MIME_BY_EXT).join(", ")} — or pass mimeType explicitly.`,
+      );
+    }
 
     if (isDryRun(args, ctx)) {
       return {
@@ -605,7 +619,7 @@ const createVoucher: ToolDef = {
       );
     }
 
-    const voucher: Row = {
+    const base: Row = {
       objectName: "Voucher",
       mapAll: true,
       voucherDate: requireString(args, "voucherDate"),
@@ -616,21 +630,49 @@ const createVoucher: ToolDef = {
       creditDebit,
       voucherType: "VOU",
       ...(optString(args, "payDate") ? { payDate: optString(args, "payDate") } : {}),
-      ...((args.extra as Row | undefined) ?? {}),
     };
+    // `extra` is for genuinely additional fields; it must not silently
+    // override what the tool's own arguments and guards decided.
+    const extra = (args.extra ?? {}) as Row;
+    const collisions = Object.keys(extra).filter((k) => base[k] !== undefined);
+    if (collisions.length) {
+      throw new Error(
+        `Refused: extra would override field(s) this tool sets itself: ${collisions.join(", ")}. ` +
+          "Use the dedicated arguments instead.",
+      );
+    }
+    const voucher: Row = { ...base, ...extra };
 
-    const voucherPosSave = positionsIn.map((p) => {
-      const hasNet = typeof p.sumNet === "number";
+    const voucherPosSave = positionsIn.map((p, i) => {
+      const at = `Position ${i + 1}`;
+      // No silent coercion: a missing rate must not become 0 %, a missing sum a 0 EUR position.
+      if (typeof p.taxRate !== "number" || !Number.isFinite(p.taxRate)) {
+        throw new Error(`${at}: taxRate must be a number.`);
+      }
+      if (rule.allowedRates !== null && !(rule.allowedRates as readonly number[]).includes(p.taxRate)) {
+        throw new Error(
+          `${at}: taxRate ${p.taxRate} is not allowed with rule ${taxRuleId} ("${rule.label}") — ` +
+            `allowed: ${rule.allowedRates.join(", ")}.`,
+        );
+      }
+      const given = (v: unknown) => v !== undefined && v !== null;
+      if (given(p.sumNet) === given(p.sumGross)) {
+        throw new Error(`${at}: give exactly one of sumNet or sumGross.`);
+      }
+      const sum = given(p.sumNet) ? p.sumNet : p.sumGross;
+      if (typeof sum !== "number" || !Number.isFinite(sum)) {
+        throw new Error(`${at}: ${given(p.sumNet) ? "sumNet" : "sumGross"} must be a finite number.`);
+      }
+      const hasNet = given(p.sumNet);
+      const accountingTypeId = optId(p, "accountingTypeId");
       return {
         objectName: "VoucherPos",
         mapAll: true,
-        accountingType: p.accountingTypeId
-          ? { id: String(p.accountingTypeId), objectName: "AccountingType" }
-          : undefined,
-        taxRate: num(p.taxRate),
+        accountingType: accountingTypeId ? { id: accountingTypeId, objectName: "AccountingType" } : undefined,
+        taxRate: p.taxRate,
         net: hasNet,
-        sumNet: hasNet ? num(p.sumNet) : undefined,
-        sumGross: !hasNet ? num(p.sumGross) : undefined,
+        sumNet: hasNet ? sum : undefined,
+        sumGross: !hasNet ? sum : undefined,
         comment: p.comment,
       };
     });
@@ -692,7 +734,7 @@ const receiptGuidance: ToolDef = {
     const query = optString(args, "query")?.toLowerCase();
     const accountNumber = optString(args, "accountNumber");
     const taxRuleId = optString(args, "taxRuleId");
-    const limit = optNumber(args, "limit") ?? 20;
+    const limit = optLimit(args, "limit", 20, 1000);
 
     const { data } = await ctx.client.request<{ objects?: Row[] }>({
       method: "GET",
@@ -752,7 +794,7 @@ const setTaxRule: ToolDef = {
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const id = requireString(args, "voucherId");
+    const id = requireId(args, "voucherId");
     const target = requireString(args, "taxRuleId") as TaxRuleId;
     if (!VOUCHER_RULE_IDS.includes(target)) {
       throw new Error(
@@ -855,7 +897,7 @@ const createInvoice: ToolDef = {
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const contactId = requireString(args, "contactId");
+    const contactId = requireId(args, "contactId");
     const positions = Array.isArray(args.positions) ? (args.positions as Row[]) : [];
     if (positions.length === 0) throw new Error("At least one position is required.");
 
@@ -890,12 +932,18 @@ const createInvoice: ToolDef = {
             "One Stop Shop rates depend on the destination country.",
         );
       }
+      if (typeof p.name !== "string" || p.name.trim() === "") {
+        throw new Error(`Position ${i + 1}: name must be a non-empty string.`);
+      }
+      if (typeof p.price !== "number" || !Number.isFinite(p.price)) {
+        throw new Error(`Position ${i + 1}: price must be a finite number.`);
+      }
       return {
         objectName: "InvoicePos",
         mapAll: true,
-        name: String(p.name ?? ""),
+        name: p.name,
         quantity,
-        price: num(p.price),
+        price: p.price,
         taxRate: typeof p.taxRate === "number" ? p.taxRate : (defaultRate as number),
         unity: { id: 1, objectName: "Unity" },
       };
@@ -968,8 +1016,8 @@ const getInvoicePdf: ToolDef = {
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const id = requireString(args, "invoiceId");
-    const dir = assertAllowedPath(ctx, requireString(args, "directory"));
+    const id = requireId(args, "invoiceId");
+    const dir = await assertAllowedPath(ctx, requireString(args, "directory"));
 
     const { data } = await ctx.client.request<Row>({
       method: "GET",
@@ -1023,7 +1071,7 @@ const markInvoiceSent: ToolDef = {
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const id = requireString(args, "invoiceId");
+    const id = requireId(args, "invoiceId");
     const sendType = optString(args, "sendType") ?? "VPDF";
 
     await fetchUnenshrined(ctx, "Invoice", id);

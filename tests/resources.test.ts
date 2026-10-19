@@ -1,6 +1,7 @@
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { realpath } from "node:fs/promises";
 
 import { describe, expect, it } from "vitest";
 
@@ -341,7 +342,7 @@ describe("sevdesk_get_invoice_pdf", () => {
     const result = (await getInvoicePdf.handler({ invoiceId: "900", directory: dir }, ctx)) as {
       saved: string;
     };
-    expect(result.saved).toBe(join(dir, "RE-1001.pdf"));
+    expect(result.saved).toBe(join(await realpath(dir), "RE-1001.pdf"));
     expect(String(await readFile(result.saved))).toBe("PDF-BYTES");
     const pdfCall = sent.find((c) => c.path.endsWith("/getPdf"))!;
     expect((pdfCall.query as Row).preventSendBy).toBe(true);
@@ -508,7 +509,7 @@ describe("sevdesk_create_voucher", () => {
 
   it("passes the given rule through", async () => {
     const out = (await createVoucher.handler(
-      { ...args, taxRuleId: "12" },
+      { ...args, taxRuleId: "12", positions: [{ sumNet: 100, taxRate: 0 }] },
       ctxWith(() => ({ status: 200, data: {} })),
     )) as { wouldSend: { body: { voucher: Record<string, Row> } } };
     expect(out.wouldSend.body.voucher.taxRule).toEqual({ id: "12", objectName: "TaxRule" });

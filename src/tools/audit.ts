@@ -21,6 +21,7 @@ import {
   bool,
   int,
   optBool,
+  optLimit,
   optNumber,
   optString,
   requireString,
@@ -259,7 +260,7 @@ const auditVat: ToolDef = {
   async handler(args, ctx) {
     const period = readPeriod(args);
     const withPositions = optBool(args, "includePositions") ?? true;
-    const vouchers = await fetchVouchers(ctx, period, optNumber(args, "maxVouchers") ?? 2000);
+    const vouchers = await fetchVouchers(ctx, period, optLimit(args, "maxVouchers", 2000, 20_000));
     const sides = new Set<VoucherSide>(vouchers.map((v) => voucherSide(v) ?? "expense"));
 
     // Positions, contacts and guidance depend only on the voucher list — fetch
@@ -557,7 +558,7 @@ const reverseChargeReport: ToolDef = {
     const period = readPeriod(args);
     const rate = optNumber(args, "rate") ?? 19;
     const [vouchers, { countries, warnings }] = await Promise.all([
-      fetchVouchers(ctx, period, optNumber(args, "maxVouchers") ?? 2000),
+      fetchVouchers(ctx, period, optLimit(args, "maxVouchers", 2000, 20_000)),
       fetchSupplierCountries(ctx),
     ]);
 
@@ -673,7 +674,7 @@ const findDuplicates: ToolDef = {
   async handler(args, ctx) {
     const period = readPeriod(args);
     const dayWindow = optNumber(args, "dayWindow") ?? 7;
-    const vouchers = await fetchVouchers(ctx, period, optNumber(args, "maxVouchers") ?? 2000);
+    const vouchers = await fetchVouchers(ctx, period, optLimit(args, "maxVouchers", 2000, 20_000));
 
     const byNumber = new Map<string, Row[]>();
     for (const v of vouchers) {
@@ -767,7 +768,7 @@ const subscriptionGaps: ToolDef = {
   async handler(args, ctx) {
     const period = readPeriod(args);
     const minMonths = optNumber(args, "minMonths") ?? 3;
-    const vouchers = await fetchVouchers(ctx, period, optNumber(args, "maxVouchers") ?? 2000);
+    const vouchers = await fetchVouchers(ctx, period, optLimit(args, "maxVouchers", 2000, 20_000));
 
     const bySupplier = new Map<string, { name: string; months: Map<string, number> }>();
     for (const v of vouchers) {
@@ -891,7 +892,7 @@ const diffReceiptFolder: ToolDef = {
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const target = assertAllowedPath(ctx, requireString(args, "directory"));
+    const target = await assertAllowedPath(ctx, requireString(args, "directory"));
 
     const info = await stat(target).catch(() => null);
     if (!info?.isDirectory()) throw new Error(`Not a directory: ${target}`);
@@ -1010,7 +1011,7 @@ const reconcileTransactions: ToolDef = {
   async handler(args, ctx) {
     const period = readPeriod(args);
     const window = optNumber(args, "dayWindow") ?? 5;
-    const maxItems = optNumber(args, "maxItems") ?? 2000;
+    const maxItems = optLimit(args, "maxItems", 2000, 20_000);
 
     const [transactions, vouchers] = await Promise.all([
       ctx.client.getAll<Row>("/CheckAccountTransaction", {}, { maxItems }),
@@ -1112,7 +1113,7 @@ const invoiceAging: ToolDef = {
     const all = await ctx.client.getAll<Row>(
       "/Invoice",
       { embed: "contact" },
-      { maxItems: optNumber(args, "maxItems") ?? 2000 },
+      { maxItems: optLimit(args, "maxItems", 2000, 20_000) },
     );
     const invoices = all.filter((i) => inPeriod(parseSevdeskDate(i.invoiceDate), period));
     const now = new Date();
