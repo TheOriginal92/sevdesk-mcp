@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+**Breaking**
+
+- VAT-regime detection is removed: the server no longer infers or
+  configures Kleinunternehmer vs regular VAT, `sevdesk_ping` no longer
+  returns `vatProfile`, and the `vat_regime_mismatch` audit finding is
+  gone. `SEVDESK_VAT_REGIME` and `SEVDESK_KLEINUNTERNEHMER` are no longer
+  read (a startup notice is printed if either is still set). Audit
+  reverse-charge advice is now the same for every account.
+- `taxRuleId` is required on `sevdesk_create_invoice` and
+  `sevdesk_create_voucher`; the server does not guess a tax treatment.
+  `sevdesk_create_voucher` also refuses a rule from the wrong side (an
+  expense rule needs `creditDebit` C, a revenue rule D).
+
+**Fixed** (thanks @TheOriginal92, PR #2)
+
+- `sevdesk_create_voucher` attaches the uploaded receipt via the
+  top-level `filename` of `saveVoucher`, where sevDesk reads it.
+- `sevdesk_upload_voucher_file` no longer returns sevDesk's base64
+  preview in its result.
+- `sevdesk_create_voucher` accepts the expense-side tax rules.
+
 - Optional `.env` support for runs outside an MCP client: a `.env` beside
   `package.json` is read at startup, so `npm run dev` and
   `node dist/index.js` no longer need the token pasted onto the command

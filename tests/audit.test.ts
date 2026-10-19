@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 
-import { createProfileResolver } from "../src/lib/profile.js";
 import type { ToolContext } from "../src/lib/tool.js";
 import { auditTools } from "../src/tools/audit.js";
 
@@ -47,16 +46,11 @@ function stubCtx(d: StubData, config: Record<string, unknown> = {}): ToolContext
   };
   const fullConfig = {
     allowedReceiptDirs: [],
-    vatRegime: "auto",
-    vatRegimeSource: config.vatRegime && config.vatRegime !== "auto" ? "env" : "default",
     ...config,
   };
   return {
     client,
     config: fullConfig,
-    // The real resolver against the stub client: audit tests exercise actual
-    // profile resolution (d.invoices feeds the ledger inference).
-    getProfile: createProfileResolver(client as never, fullConfig as never),
   } as unknown as ToolContext;
 }
 
@@ -155,22 +149,21 @@ describe("sevdesk_audit_vat", () => {
     expect(result.warnings[0]).toContain("6");
   });
 
-  it("tailors the reverse-charge suggestion for Kleinunternehmer", async () => {
-    const ctx = stubCtx(
-      {
-        vouchers: [voucher({ id: "20", taxRule: { id: "9" }, supplierName: "Northwind Cloud, PBC" })],
-        positionsByVoucher: { "20": [{ taxRate: 0 }] },
-      },
-      { vatRegime: "kleinunternehmer" },
-    );
+  it("gives neutral reverse-charge advice naming rules 12, 13 and 14", async () => {
+    const ctx = stubCtx({
+      vouchers: [voucher({ id: "20", taxRule: { id: "9" }, supplierName: "Northwind Cloud, PBC" })],
+      positionsByVoucher: { "20": [{ taxRate: 0 }] },
+    });
     const result = (await auditVat.handler({}, ctx)) as AuditResult & {
       findings: Array<{ code: string; suggestion: string }>;
     };
     const f = result.findings.find((x) => x.code === "zero_rate_booked_as_domestic");
     expect(f).toBeDefined();
-    expect(f!.suggestion).toContain("taxRule 13");
-    expect(f!.suggestion).toContain("Kleinunternehmer");
-    expect(f!.suggestion).not.toContain("taxRule 12");
+    for (const rule of ["taxRule 12", "taxRule 13", "taxRule 14"]) {
+      expect(f!.suggestion).toContain(rule);
+    }
+    expect(f!.suggestion).not.toMatch(/Kleinunternehmer|regime/i);
+    expect(result.findings.some((x) => x.code === "vat_regime_mismatch")).toBe(false);
   });
 
   it("raises severity when the supplier's contact country is foreign", async () => {

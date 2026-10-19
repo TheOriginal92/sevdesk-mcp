@@ -7,13 +7,6 @@ export interface Config {
   readOnly: boolean;
   /** When true, mutating operations describe what they would send instead of sending it. */
   dryRun: boolean;
-  /**
-   * VAT regime the account lives under. `auto` (the default) infers it
-   * from the ledger at first use; explicit values win outright.
-   */
-  vatRegime: "regular" | "kleinunternehmer" | "auto";
-  /** Where vatRegime came from — `legacy-env` marks the deprecated boolean. */
-  vatRegimeSource: "env" | "legacy-env" | "default";
   requestTimeoutMs: number;
   maxRetries: number;
   /**
@@ -54,33 +47,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
 
-  // SEVDESK_VAT_REGIME wins; the deprecated boolean applies only when it
-  // is unset. A typo must fail loudly, not silently become `auto`.
-  let vatRegime: Config["vatRegime"] = "auto";
-  let vatRegimeSource: Config["vatRegimeSource"] = "default";
-  const rawRegime = env.SEVDESK_VAT_REGIME?.trim().toLowerCase();
-  if (rawRegime) {
-    if (rawRegime === "regular" || rawRegime === "kleinunternehmer" || rawRegime === "auto") {
-      vatRegime = rawRegime;
-      vatRegimeSource = rawRegime === "auto" ? "default" : "env";
-    } else {
-      throw new Error(
-        `SEVDESK_VAT_REGIME='${env.SEVDESK_VAT_REGIME}' is not valid. ` +
-          `Use 'regular', 'kleinunternehmer' or 'auto'.`,
-      );
-    }
-  } else if (bool(env.SEVDESK_KLEINUNTERNEHMER, false)) {
-    vatRegime = "kleinunternehmer";
-    vatRegimeSource = "legacy-env";
-  }
-
   return {
     apiToken,
     baseUrl: (env.SEVDESK_BASE_URL ?? "https://my.sevdesk.de/api/v1").replace(/\/+$/, ""),
     readOnly: bool(env.SEVDESK_READ_ONLY, false),
     dryRun: bool(env.SEVDESK_DRY_RUN, false),
-    vatRegime,
-    vatRegimeSource,
     requestTimeoutMs: int(env.SEVDESK_TIMEOUT_MS, 30_000),
     maxRetries: int(env.SEVDESK_MAX_RETRIES, 3),
     rateLimitPerSec: rate(env.SEVDESK_RATE_LIMIT, 4),

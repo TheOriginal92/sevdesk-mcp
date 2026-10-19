@@ -4,20 +4,8 @@ import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import type { VatProfile } from "../src/lib/profile.js";
 import type { ToolContext } from "../src/lib/tool.js";
 import { resourceTools } from "../src/tools/resources.js";
-
-function stubProfile(
-  regime: "regular" | "kleinunternehmer" | "unknown" = "regular",
-): VatProfile {
-  return {
-    regime,
-    source: regime === "unknown" ? "unresolved" : "env",
-    evidence: "test stub",
-    ledger: null,
-  };
-}
 
 const ping = resourceTools.find((t) => t.name === "sevdesk_ping")!;
 const setTaxRule = resourceTools.find((t) => t.name === "sevdesk_set_tax_rule")!;
@@ -44,7 +32,6 @@ function ctxWith(
       dryRun: false,
       allowedReceiptDirs: [],
     },
-    getProfile: async () => stubProfile(),
   } as unknown as ToolContext;
 }
 
@@ -61,6 +48,7 @@ describe("sevdesk_ping", () => {
     };
     expect(result.ok).toBe(true);
     expect(result.bookkeepingSystemVersion).toBe("2.0");
+    expect(result).not.toHaveProperty("vatProfile");
   });
 
   it("still succeeds when the version endpoint fails", async () => {
@@ -124,7 +112,6 @@ function voucherCtx(v: Row | null, opts: { dryRun?: boolean } = {}) {
   const ctx = {
     client,
     config: { readOnly: false, dryRun: opts.dryRun ?? false, allowedReceiptDirs: [] },
-    getProfile: async () => stubProfile(),
   } as unknown as ToolContext;
   return { ctx, sent };
 }
@@ -219,7 +206,6 @@ describe("sevdesk_receipt_guidance", () => {
 function invoiceCtx(
   invoice: Row | null,
   config: Record<string, unknown> = {},
-  regime: "regular" | "kleinunternehmer" | "unknown" = "regular",
 ) {
   const sent: Array<{ method: string; path: string; body?: unknown; query?: unknown }> = [];
   const client = {
@@ -267,7 +253,6 @@ function invoiceCtx(
       allowedReceiptDirs: [],
       ...config,
     },
-    getProfile: async () => stubProfile(regime),
   } as unknown as ToolContext;
   return { ctx, sent };
 }
@@ -275,10 +260,11 @@ function invoiceCtx(
 describe("sevdesk_create_invoice", () => {
   const args = {
     contactId: "77",
+    taxRuleId: "1",
     positions: [{ name: "Consulting", quantity: 2, price: 100, taxRate: 19 }],
   };
 
-  it("always creates drafts, with the domestic revenue rule by default", async () => {
+  it("always creates drafts under the rule it was given", async () => {
     const { ctx, sent } = invoiceCtx(null);
     const result = (await createInvoice.handler(args, ctx)) as {
       invoiceId: string;
@@ -301,30 +287,43 @@ describe("sevdesk_create_invoice", () => {
     const { ctx } = invoiceCtx(null);
     await expect(
       createInvoice.handler(
-        { contactId: "77", positions: [{ name: "X", price: 100, taxRate: null }] },
+        { contactId: "77", taxRuleId: "1", positions: [{ name: "X", price: 100, taxRate: null }] },
         ctx,
       ),
     ).rejects.toThrow(/taxRate/);
     await expect(
       createInvoice.handler(
-        { contactId: "77", positions: [{ name: "X", price: 100, quantity: 0 }] },
+        { contactId: "77", taxRuleId: "1", positions: [{ name: "X", price: 100, quantity: 0 }] },
         ctx,
       ),
     ).rejects.toThrow(/quantity/);
   });
 
-  it("uses the §19 rule for Kleinunternehmer", async () => {
-    const { ctx, sent } = invoiceCtx(null, {}, "kleinunternehmer");
-    await createInvoice.handler(
-      { contactId: "77", positions: [{ name: "Consulting", price: 100 }] },
-      ctx,
+  it("refuses without a taxRuleId instead of guessing one", async () => {
+    const { ctx, sent } = invoiceCtx(null);
+    await expect(
+      createInvoice.handler({ contactId: "77", positions: [{ name: "Consulting", price: 100 }] }, ctx),
+    ).rejects.toThrow(/taxRuleId is required/);
+    expect(sent).toEqual([]);
+    expect(createInvoice.inputSchema.required).toContain("taxRuleId");
+  });
+
+  it("gives rule 11 0 % and the §19 text, rule 1 19 %", async () => {
+    const { ctx, sent } = invoiceCtx(null);
+    const positions = [{ name: "Consulting", price: 100 }];
+    await createInvoice.handler({ contactId: "77", taxRuleId: "11", positions }, ctx);
+    await createInvoice.handler({ contactId: "77", taxRuleId: "1", positions }, ctx);
+    const bodies = sent.map(
+      (c) =>
+        c.body as {
+          invoice: { taxRule: { id: string }; taxText: string };
+          invoicePosSave: Array<{ taxRate: number }>;
+        },
     );
-    const body = sent[0]!.body as {
-      invoice: { taxRule: { id: string } };
-      invoicePosSave: Array<{ taxRate: number }>;
-    };
-    expect(body.invoice.taxRule.id).toBe("11");
-    expect(body.invoicePosSave[0]!.taxRate).toBe(0);
+    expect(bodies[0]!.invoice.taxRule.id).toBe("11");
+    expect(bodies[0]!.invoicePosSave[0]!.taxRate).toBe(0);
+    expect(bodies[0]!.invoice.taxText).toBe("Gemäß § 19 UStG wird keine Umsatzsteuer berechnet.");
+    expect(bodies[1]!.invoicePosSave[0]!.taxRate).toBe(19);
   });
 
   it("previews with dryRun instead of sending", async () => {
@@ -394,7 +393,6 @@ describe("sevdesk_summarize", () => {
     return {
       client: { async getAll() { return rows; } },
       config: { readOnly: true, dryRun: false, allowedReceiptDirs: [] },
-      getProfile: async () => stubProfile(),
     } as unknown as ToolContext;
   }
 
@@ -472,6 +470,7 @@ describe("sevdesk_create_voucher", () => {
   const args = {
     supplierName: "Acme Ltd",
     voucherDate: "01.09.2026",
+    taxRuleId: "9",
     positions: [{ sumNet: 100, taxRate: 19 }],
     dryRun: true,
   };
@@ -489,24 +488,30 @@ describe("sevdesk_create_voucher", () => {
     expect(out.wouldSend.body.voucher).not.toHaveProperty("filename");
   });
 
-  it("defaults an expense voucher to the expense rule, not the revenue one", async () => {
-    const out = (await createVoucher.handler(
-      args,
-      ctxWith(() => ({ status: 200, data: {} })),
-    )) as { wouldSend: { body: { voucher: Record<string, Row> } } };
-
-    // Rule 1 is "Umsatzsteuerpflichtige Umsätze" — the revenue side. A credit
-    // voucher is an expense, where the equivalent default is rule 9.
-    expect(out.wouldSend.body.voucher.taxRule).toEqual({ id: "9", objectName: "TaxRule" });
+  it("refuses without a taxRuleId instead of defaulting one", async () => {
+    const { taxRuleId: _omit, ...noRule } = args;
+    await expect(
+      createVoucher.handler(noRule, ctxWith(() => ({ status: 200, data: {} }))),
+    ).rejects.toThrow(/taxRuleId is required/);
+    expect(createVoucher.inputSchema.required).toContain("taxRuleId");
   });
 
-  it("keeps rule 1 as the default for a debit (revenue) voucher", async () => {
+  it("refuses a revenue rule on a C voucher, and an expense rule on a D voucher", async () => {
+    const ctx = ctxWith(() => ({ status: 200, data: {} }));
+    await expect(createVoucher.handler({ ...args, taxRuleId: "1" }, ctx)).rejects.toThrow(
+      /revenue rule/,
+    );
+    await expect(
+      createVoucher.handler({ ...args, taxRuleId: "9", creditDebit: "D" }, ctx),
+    ).rejects.toThrow(/expense rule/);
+  });
+
+  it("passes the given rule through", async () => {
     const out = (await createVoucher.handler(
-      { ...args, creditDebit: "D" },
+      { ...args, taxRuleId: "12" },
       ctxWith(() => ({ status: 200, data: {} })),
     )) as { wouldSend: { body: { voucher: Record<string, Row> } } };
-
-    expect(out.wouldSend.body.voucher.taxRule).toEqual({ id: "1", objectName: "TaxRule" });
+    expect(out.wouldSend.body.voucher.taxRule).toEqual({ id: "12", objectName: "TaxRule" });
   });
 
   it("offers the expense-side rules its own description points at", async () => {
@@ -561,7 +566,6 @@ describe("sevdesk_upload_voucher_file", () => {
         dryRun: false,
         allowedReceiptDirs: [dir],
       },
-      getProfile: async () => stubProfile(),
     } as unknown as ToolContext;
 
     const out = (await upload.handler({ filePath: file }, ctx)) as {

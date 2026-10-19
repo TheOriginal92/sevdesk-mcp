@@ -26,19 +26,11 @@ import {
   type ToolContext,
   type ToolDef,
 } from "../lib/tool.js";
-import { regimeMismatch } from "../lib/profile.js";
 
 /** Rule ids the sevDesk API accepts on vouchers — one source for schema enums and error texts. */
 const VOUCHER_RULE_IDS = Object.entries(TAX_RULES)
   .filter(([, r]) => r.usableInVouchers)
   .map(([id]) => id as TaxRuleId);
-
-/**
- * sevDesk's default rule per voucher side: the two rules the legacy
- * `taxType: "default"` mapped to. A voucher is an expense unless it is a
- * debit, so the expense rule is the one to fall back to.
- */
-const DEFAULT_VOUCHER_RULE: Record<"C" | "D", TaxRuleId> = { C: "9", D: "1" };
 
 /** Fetch a single document and refuse to hand it out for editing when it is enshrined. */
 async function fetchUnenshrined(
@@ -83,7 +75,7 @@ const ping: ToolDef = {
   title: "Check the sevDesk connection",
   description:
     "Verify the API token, report server mode, bookkeeping generation (1.0 taxType / " +
-    "2.0 taxRule) and the account's detected VAT regime. Run this first.",
+    "2.0 taxRule). Run this first.",
   mutating: false,
   inputSchema: { type: "object", properties: {}, additionalProperties: false },
   async handler(_args, ctx) {
@@ -102,20 +94,11 @@ const ping: ToolDef = {
       // Some accounts may not expose the endpoint; the ping itself still counts.
     }
 
-    const profile = await ctx.getProfile();
-    const mismatch = regimeMismatch(profile);
-
     return {
       ok: status === 200,
       baseUrl: ctx.config.baseUrl,
       bookkeepingSystemVersion: version,
       mode: ctx.config.readOnly ? "READ-ONLY" : ctx.config.dryRun ? "DRY-RUN" : "read/write",
-      vatProfile: {
-        regime: profile.regime,
-        source: profile.source,
-        evidence: profile.evidence,
-        ...(mismatch ? { warning: mismatch } : {}),
-      },
       receiptDirsAllowed: ctx.config.allowedReceiptDirs.length
         ? ctx.config.allowedReceiptDirs
         : "file tools disabled (SEVDESK_RECEIPT_DIRS not set)",
@@ -567,9 +550,8 @@ const createVoucher: ToolDef = {
       description: str("Document/invoice number."),
       taxRuleId: str(
         `VAT regulation id — every rule sevDesk accepts on a voucher, both sides. ` +
-          `sevdesk_receipt_guidance lists the ones the booking account actually allows. ` +
-          `Defaults to ${DEFAULT_VOUCHER_RULE.C} (deductible expense) for creditDebit C ` +
-          `and ${DEFAULT_VOUCHER_RULE.D} for D.`,
+          `Required — never guessed. sevdesk_receipt_guidance lists the ones the booking ` +
+          `account actually allows. Expense rules go with creditDebit C, revenue rules with D.`,
         { enum: VOUCHER_RULE_IDS },
       ),
       creditDebit: str("C = credit, D = debit.", { enum: ["C", "D"] }),
@@ -595,7 +577,7 @@ const createVoucher: ToolDef = {
       extra: obj("Additional top-level voucher fields merged into the payload verbatim."),
       dryRun: bool("Show the payload instead of sending it."),
     },
-    required: ["supplierName", "voucherDate", "positions"],
+    required: ["supplierName", "voucherDate", "taxRuleId", "positions"],
     additionalProperties: false,
   },
   async handler(args, ctx) {
@@ -604,9 +586,24 @@ const createVoucher: ToolDef = {
 
     const status = optString(args, "status") ?? "50";
     const creditDebit = optString(args, "creditDebit") === "D" ? "D" : "C";
-    // An expense voucher defaulting to rule 1 ("Umsatzsteuerpflichtige Umsätze")
-    // books it under a revenue rule — default per side instead.
-    const taxRuleId = optString(args, "taxRuleId") ?? DEFAULT_VOUCHER_RULE[creditDebit];
+    const taxRuleId = optString(args, "taxRuleId");
+    if (!taxRuleId) {
+      throw new Error(
+        "taxRuleId is required: the server does not guess a tax treatment. " +
+          "sevdesk_receipt_guidance lists the rules the booking account allows.",
+      );
+    }
+    const rule = TAX_RULES[taxRuleId as TaxRuleId];
+    if (!rule || !rule.usableInVouchers) {
+      throw new Error(`taxRuleId '${taxRuleId}' is not usable on a voucher (${VOUCHER_RULE_IDS.join(", ")}).`);
+    }
+    // C = expense, D = revenue: a rule from the other side books the voucher wrongly.
+    if (rule.side !== (creditDebit === "C" ? "expense" : "revenue")) {
+      throw new Error(
+        `taxRuleId ${taxRuleId} ("${rule.label}") is a ${rule.side} rule, but creditDebit ` +
+          `${creditDebit} is ${creditDebit === "C" ? "an expense" : "a revenue"} voucher.`,
+      );
+    }
 
     const voucher: Row = {
       objectName: "Voucher",
@@ -846,7 +843,7 @@ const createInvoice: ToolDef = {
       },
       invoiceDate: str("Invoice date, yyyy-mm-dd (default today)."),
       header: str("Optional invoice header text."),
-      taxRuleId: str("Revenue tax rule id. Default follows the account's VAT regime: 1 (regular) or 11 (§19 Kleinunternehmer); required if the regime cannot be detected.", {
+      taxRuleId: str("Revenue tax rule id — required, never guessed. 1 taxable domestic, 2 export, 3 intra-EU supply, 4 §4 exempt, 5 §13b, 11 §19 UStG (no VAT shown), 17 not taxable domestically, 18-20 One Stop Shop (per-position taxRate required), 21 §18b.", {
         // Model_Invoice.taxRule per the sevDesk spec — invoices accept the OSS
         // and §18b rules that vouchers refuse, and not the guidance-only 22.
         enum: ["1", "2", "3", "4", "5", "11", "17", "18", "19", "20", "21"],
@@ -854,7 +851,7 @@ const createInvoice: ToolDef = {
       currency: str("Currency (default EUR)."),
       dryRun: bool("Preview the request without sending it."),
     },
-    required: ["contactId", "positions"],
+    required: ["contactId", "taxRuleId", "positions"],
     additionalProperties: false,
   },
   async handler(args, ctx) {
@@ -862,26 +859,19 @@ const createInvoice: ToolDef = {
     const positions = Array.isArray(args.positions) ? (args.positions as Row[]) : [];
     if (positions.length === 0) throw new Error("At least one position is required.");
 
-    // The regime only chooses the default RULE; the rule then dictates the
-    // default rate. An account whose regime cannot be detected gets no
-    // silent default — a wrong guess is a wrong legal document either way.
-    let ruleId = optString(args, "taxRuleId");
+    const ruleId = optString(args, "taxRuleId");
     if (!ruleId) {
-      const profile = await ctx.getProfile();
-      if (profile.regime === "unknown") {
-        throw new Error(
-          "Cannot choose a tax rule: the account's VAT regime is unknown " +
-            `(${profile.evidence}). Pass taxRuleId explicitly — 1 for regular VAT, ` +
-            "11 for §19 Kleinunternehmer — or set SEVDESK_VAT_REGIME.",
-        );
-      }
-      ruleId = profile.regime === "kleinunternehmer" ? "11" : "1";
+      throw new Error(
+        "taxRuleId is required: the server does not guess a tax treatment. " +
+          "Rules: 1 taxable domestic, 2 export, 3 intra-EU supply, 4 §4 exempt, 5 §13b, " +
+          "11 §19 UStG, 17 not taxable domestically, 18-20 One Stop Shop, 21 §18b.",
+      );
     }
     const rule = TAX_RULES[ruleId as TaxRuleId];
     if (!rule || rule.side !== "revenue" || ruleId === "22") {
       throw new Error(`taxRuleId '${ruleId}' is not a usable invoice revenue rule.`);
     }
-    // OSS rules have destination-dependent rates — no default is safe.
+    // The rule dictates the default rate. OSS rules have destination-dependent rates — no default is safe.
     const defaultRate =
       rule.allowedRates === null ? null : (rule.allowedRates as readonly number[]).includes(19) ? 19 : 0;
     const date = optString(args, "invoiceDate") ?? ymd(new Date());

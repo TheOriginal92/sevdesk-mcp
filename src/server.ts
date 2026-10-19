@@ -24,10 +24,11 @@ export function buildServer(ctx: ToolContext): Server {
       capabilities: { tools: {} },
       instructions:
         `sevDesk accounting (German SMB bookkeeping) for AI agents. ` +
-        `Mode: ${ctx.config.readOnly ? "READ-ONLY — write tools are hidden" : ctx.config.dryRun ? "DRY-RUN — writes preview instead of sending" : "read/write — writes create drafts only"}. ` +
+        `Mode: ${ctx.config.readOnly ? "READ-ONLY — write tools are hidden" : ctx.config.dryRun ? "DRY-RUN — writes preview instead of sending" : "read/write — writes default to drafts"}. ` +
         `Start with sevdesk_ping: it verifies the token and reports the account's ` +
-        `bookkeeping generation and detected VAT regime (regular vs §19 Kleinunternehmer) ` +
-        `with evidence — tax defaults and audit advice follow that regime. ` +
+        `bookkeeping generation. Tax rules are never guessed: write tools that need one ` +
+        `take taxRuleId explicitly, and sevdesk_receipt_guidance lists what each booking ` +
+        `account allows. ` +
         `Prefer the curated sevdesk_* tools; for anything else use sevdesk_call after ` +
         `sevdesk_list_operations / sevdesk_describe_operation. Every write accepts ` +
         `dryRun:true for a preview. Dates are yyyy-mm-dd; amounts EUR unless stated.`,
