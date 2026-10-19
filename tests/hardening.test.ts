@@ -367,3 +367,114 @@ describe("remaining create_voucher / upload guards", () => {
     expect(out.wouldSend.file).toBe(join(root, "alias.pdf"));
   });
 });
+
+describe("round 3 guards", () => {
+  const call = tool("sevdesk_call");
+  const mk = () => {
+    const sent: Array<{ body?: unknown; mutating?: boolean }> = [];
+    return {
+      sent,
+      ctx: {
+        client: { async request(o: { body?: unknown }) { sent.push(o); return { status: 200, data: {} }; } },
+        config: { readOnly: false, dryRun: false, baseUrl: "https://example.test/api/v1" },
+      } as unknown as ToolContext,
+    };
+  };
+
+  it("keeps an empty body on a write but accepts null/{}/[] as no body on a GET", async () => {
+    const { ctx, sent } = mk();
+    await call.handler({ operationId: "voucherFactorySaveVoucher", body: {} }, ctx);
+    expect(sent[0]!.body).toEqual({});
+    for (const b of [null, {}, []]) {
+      await call.handler({ operationId: "invoiceGetPdf", params: { invoiceId: 1 }, body: b }, ctx);
+    }
+    expect(sent.slice(1).every((s) => s.body === undefined)).toBe(true);
+    await expect(
+      call.handler({ operationId: "invoiceGetPdf", params: { invoiceId: 1 }, body: [1] }, ctx),
+    ).rejects.toThrow(/no request body/);
+  });
+
+  it("treats enshrine: 0 as a read", async () => {
+    const { ctx, sent } = mk();
+    await call.handler({ operationId: "exportDatevCSV", params: { enshrineDocuments: 0 } }, ctx);
+    expect(sent[0]!.mutating).toBe(false);
+  });
+
+  it("validates extra and position shapes", async () => {
+    const c = { client: {}, config: { readOnly: false, dryRun: true } } as unknown as ToolContext;
+    const v = { supplierName: "A", voucherDate: "01.09.2026", taxRuleId: "9" };
+    const ok = [{ sumNet: 1, taxRate: 19 }];
+    for (const extra of [null, [], "x"]) {
+      await expect(tool("sevdesk_create_voucher").handler({ ...v, positions: ok, extra }, c)).rejects.toThrow(/extra must be/);
+    }
+    for (const bad of [null, "x", []]) {
+      await expect(tool("sevdesk_create_voucher").handler({ ...v, positions: [bad] }, c)).rejects.toThrow("Position 1: must be an object.");
+      await expect(
+        tool("sevdesk_create_invoice").handler({ contactId: 1, taxRuleId: "1", positions: [ok[0], bad] }, c),
+      ).rejects.toThrow("Position 2: must be an object.");
+    }
+  });
+
+  it("refuses base URLs with query, fragment or credentials", () => {
+    for (const u of ["https://x.test/api?a=1", "https://x.test/api#f", "https://u:p@x.test/api", "https://u@x.test/api"]) {
+      expect(() => loadConfig(env({ SEVDESK_BASE_URL: u }))).toThrow(/query string, fragment or credentials/);
+    }
+  });
+
+  it("truncates a long sevDesk error message", () => {
+    const e = new SevdeskApiError(400, "GET", "/x", { error: { message: "m".repeat(2000) } });
+    expect(e.message.length).toBeLessThan(700);
+  });
+
+  it("get_invoice_pdf refuses a non-directory before any request", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sevdesk-mcp-pdf-"));
+    await writeFile(join(dir, "f"), "x");
+    let calls = 0;
+    const c = {
+      client: { async request() { calls++; return { status: 200, data: {} }; } },
+      config: { readOnly: false, dryRun: false, allowedReceiptDirs: [dir] },
+    } as unknown as ToolContext;
+    await expect(tool("sevdesk_get_invoice_pdf").handler({ invoiceId: 1, directory: join(dir, "f") }, c)).rejects.toThrow(/Not a directory/);
+    expect(calls).toBe(0);
+  });
+});
+
+describe("audit argument bounds and diff truncation", () => {
+  const dup = tool("sevdesk_find_duplicates");
+  it("has bounded schemas for the numeric args", () => {
+    const props = (n: string) => tool(n).inputSchema.properties as Record<string, Row>;
+    expect(props("sevdesk_find_duplicates").dayWindow).toMatchObject({ minimum: 0, maximum: 366 });
+    expect(props("sevdesk_diff_receipt_folder").dayTolerance).toMatchObject({ minimum: 0, maximum: 366 });
+    expect(props("sevdesk_diff_receipt_folder").maxVouchers).toMatchObject({ minimum: 1, maximum: 20000 });
+    expect(dup).toBeDefined();
+  });
+
+  it("clamps a negative day window instead of silently matching nothing", async () => {
+    const ctx = {
+      client: { getAll: async () => [
+        { id: "1", voucherDate: "2026-06-01", sumGross: 10, supplierName: "A", status: "100", creditDebit: "C" },
+        { id: "2", voucherDate: "2026-06-01", sumGross: 10, supplierName: "A", status: "100", creditDebit: "C" },
+      ] },
+      config: {},
+    } as unknown as ToolContext;
+    const out = (await dup.handler({ dayWindow: -50 }, ctx)) as { sameSupplierSameAmount: unknown[] };
+    expect(out.sameSupplierSameAmount.length).toBe(1); // same-day pair is still found at window 0
+  });
+
+  it("diff_receipt_folder flags a hit voucher cap, and refuses non-string extensions", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sevdesk-mcp-diff-"));
+    await writeFile(join(dir, "a.pdf"), "x");
+    const rows = Array.from({ length: 3 }, (_, i) => ({ id: String(i), voucherDate: "2026-06-01", status: "100" }));
+    const ctx = {
+      client: { getAll: async (_p: string, _q: unknown, o: { maxItems: number }) => rows.slice(0, o.maxItems) },
+      config: { allowedReceiptDirs: [dir] },
+    } as unknown as ToolContext;
+    const diff = tool("sevdesk_diff_receipt_folder");
+    const hit = (await diff.handler({ directory: dir, maxVouchers: 3 }, ctx)) as Row;
+    expect(hit.truncated).toBe(true);
+    expect(String(hit.warning)).toMatch(/maxVouchers/);
+    const ok = (await diff.handler({ directory: dir, maxVouchers: 5 }, ctx)) as Row;
+    expect(ok.truncated).toBe(false);
+    await expect(diff.handler({ directory: dir, extensions: [1] }, ctx)).rejects.toThrow(/extensions must be/);
+  });
+});

@@ -128,9 +128,11 @@ const callOperation: ToolDef = {
     const params = (args.params ?? {}) as Record<string, unknown>;
     // null / {} carry nothing; treat them as "no body" so a harmless filler
     // value does not fail a GET.
+    // Only on GETs: a write keeps its body verbatim (`{}` is a meaningful payload).
     const emptyBody =
-      args.body === null ||
-      (typeof args.body === "object" && !Array.isArray(args.body) && Object.keys(args.body as object).length === 0);
+      !op.mutating &&
+      (args.body === null ||
+        (typeof args.body === "object" && Object.keys(args.body as object).length === 0));
     const body = emptyBody ? undefined : args.body;
 
     if (op.mutating && ctx.config.readOnly) throw new ReadOnlyError(op.operationId);
@@ -153,8 +155,7 @@ const callOperation: ToolDef = {
     for (const p of op.params) {
       if (p.in !== "path") continue;
       const v = params[p.name];
-      const numeric = p.type === "integer" || p.type === "number";
-      if (numeric && !(typeof v === "number" ? Number.isSafeInteger(v) && v >= 0 : /^\d+$/.test(String(v)))) {
+      if (!(typeof v === "number" ? Number.isSafeInteger(v) && v >= 0 : /^\d+$/.test(String(v)))) {
         throw new Error(`Refused: path parameter '${p.name}' of ${op.operationId} must be a numeric id.`);
       }
     }
@@ -191,7 +192,8 @@ const callOperation: ToolDef = {
       if (p.in !== "query" || !/^enshrine/i.test(p.name)) continue;
       const v = params[p.name];
       // Unparseable non-empty values count as set: fail safe.
-      if (v !== undefined && v !== null && v !== "" && optBool(params, p.name) !== false) effectiveMutating = true;
+      if (v === undefined || v === null || v === "" || v === 0) continue;
+      if (optBool(params, p.name) !== false) effectiveMutating = true;
     }
     if (effectiveMutating && ctx.config.readOnly) throw new ReadOnlyError(op.operationId);
 

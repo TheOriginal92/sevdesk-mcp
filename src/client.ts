@@ -60,7 +60,10 @@ function describePayload(payload: unknown): string {
     if (err && typeof err === "object") {
       const e = err as Record<string, unknown>;
       const msg = typeof e.message === "string" ? e.message.trim() : "";
-      if (msg) return typeof e.code === "number" || typeof e.code === "string" ? `${msg} (code ${e.code})` : msg;
+      if (msg) {
+        const text = typeof e.code === "number" || typeof e.code === "string" ? `${msg} (code ${e.code})` : msg;
+        return text.slice(0, 600);
+      }
     }
   }
   return (typeof payload === "string" ? payload : JSON.stringify(payload)).slice(0, 600);

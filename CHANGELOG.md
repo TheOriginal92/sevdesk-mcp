@@ -63,6 +63,18 @@ Behaviour changes that can break existing callers are marked **(breaking)**.
 - **(breaking)** `sevdesk_upload_voucher_file` maps `.xml` (XRechnung /
   ZUGFeRD) to `application/xml` and `.jpg`/`.jpeg` to `image/jpeg`; other
   extensions are refused unless `mimeType` is passed (it used to guess JPEG).
+- **(breaking)** `SEVDESK_BASE_URL` with a query string, fragment or
+  credentials is refused at startup.
+- Audit numeric arguments are clamped and their schemas publish the range:
+  `dayWindow` / `dayTolerance` 0-366, `minMonths` 1-120, `rate` 0-100. A
+  negative value no longer silently yields "no match". `extensions` entries
+  must be strings.
+- `sevdesk_diff_receipt_folder` takes `maxVouchers` (default 2000, max 20,000)
+  and reports `truncated` plus a warning when the cap was hit, instead of
+  listing the unfetched vouchers as missing their file.
+- `sevdesk_call`: a write keeps `body: {}` as sent; on a GET `null`, `{}` and
+  `[]` count as no body. `extra` and each `positions` entry must be objects.
+  `sevdesk_get_invoice_pdf` checks the target directory before fetching.
 - Tool output is capped at 200,000 characters, with a closing line saying how
   much was cut.
 

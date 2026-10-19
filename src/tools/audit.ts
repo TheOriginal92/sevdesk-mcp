@@ -22,7 +22,7 @@ import {
   int,
   optBool,
   optLimit,
-  optNumber,
+  optRange,
   optString,
   requireString,
   str,
@@ -96,10 +96,22 @@ function dayDiff(a: Date | null, b: Date | null): number {
   return a && b ? Math.abs(a.getTime() - b.getTime()) / DAY_MS : Number.POSITIVE_INFINITY;
 }
 
-async function fetchVouchers(ctx: ToolContext, period: PeriodArgs, maxItems: number): Promise<Row[]> {
+async function fetchVouchersCapped(
+  ctx: ToolContext,
+  period: PeriodArgs,
+  maxItems: number,
+): Promise<{ vouchers: Row[]; truncated: boolean }> {
   const query: Record<string, unknown> = { embed: "supplier,taxRule" };
   const all = await ctx.client.getAll<Row>("/Voucher", query, { maxItems });
-  return all.filter((v) => inPeriod(parseSevdeskDate(v.voucherDate), period));
+  return {
+    vouchers: all.filter((v) => inPeriod(parseSevdeskDate(v.voucherDate), period)),
+    // getAll stops at the cap, so a full result may be hiding more.
+    truncated: all.length >= maxItems,
+  };
+}
+
+async function fetchVouchers(ctx: ToolContext, period: PeriodArgs, maxItems: number): Promise<Row[]> {
+  return (await fetchVouchersCapped(ctx, period, maxItems)).vouchers;
 }
 
 async function fetchPositions(
@@ -549,14 +561,14 @@ const reverseChargeReport: ToolDef = {
     properties: {
       from: str("Start of period, dd.mm.yyyy or yyyy-mm-dd."),
       to: str("End of period, dd.mm.yyyy or yyyy-mm-dd."),
-      rate: { type: "number", description: "VAT rate to apply to the base (default 19)." },
+      rate: { type: "number", description: "VAT rate in percent to apply to the base (default 19, 0-100).", minimum: 0, maximum: 100 },
       maxVouchers: int("Safety cap (default 2000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
   async handler(args, ctx) {
     const period = readPeriod(args);
-    const rate = optNumber(args, "rate") ?? 19;
+    const rate = optRange(args, "rate", 19, 0, 100);
     const [vouchers, { countries, warnings }] = await Promise.all([
       fetchVouchers(ctx, period, optLimit(args, "maxVouchers", 2000, 20_000)),
       fetchSupplierCountries(ctx),
@@ -666,14 +678,14 @@ const findDuplicates: ToolDef = {
     properties: {
       from: str("Start of period, dd.mm.yyyy or yyyy-mm-dd."),
       to: str("End of period, dd.mm.yyyy or yyyy-mm-dd."),
-      dayWindow: int("How many days apart two same-amount vouchers may be to count as duplicates (default 7)."),
+      dayWindow: int("How many days apart two same-amount vouchers may be to count as duplicates (default 7, 0-366).", { minimum: 0, maximum: 366 }),
       maxVouchers: int("Safety cap (default 2000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
   async handler(args, ctx) {
     const period = readPeriod(args);
-    const dayWindow = optNumber(args, "dayWindow") ?? 7;
+    const dayWindow = optRange(args, "dayWindow", 7, 0, 366);
     const vouchers = await fetchVouchers(ctx, period, optLimit(args, "maxVouchers", 2000, 20_000));
 
     const byNumber = new Map<string, Row[]>();
@@ -760,14 +772,14 @@ const subscriptionGaps: ToolDef = {
     properties: {
       from: str("Start of period, dd.mm.yyyy or yyyy-mm-dd."),
       to: str("End of period, dd.mm.yyyy or yyyy-mm-dd."),
-      minMonths: int("How many distinct months a supplier needs before it counts as recurring (default 3)."),
+      minMonths: int("How many distinct months a supplier needs before it counts as recurring (default 3, 1-120).", { minimum: 1, maximum: 120 }),
       maxVouchers: int("Safety cap (default 2000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
   async handler(args, ctx) {
     const period = readPeriod(args);
-    const minMonths = optNumber(args, "minMonths") ?? 3;
+    const minMonths = optRange(args, "minMonths", 3, 1, 120);
     const vouchers = await fetchVouchers(ctx, period, optLimit(args, "maxVouchers", 2000, 20_000));
 
     const bySupplier = new Map<string, { name: string; months: Map<string, number> }>();
@@ -881,7 +893,8 @@ const diffReceiptFolder: ToolDef = {
       recursive: bool("Descend into subdirectories (default false)."),
       from: str("Only consider vouchers from this date on."),
       to: str("Only consider vouchers up to this date."),
-      dayTolerance: int("Days a file date may differ from the voucher date (default 5)."),
+      dayTolerance: int("Days a file date may differ from the voucher date (default 5, 0-366).", { minimum: 0, maximum: 366 }),
+      maxVouchers: int("Safety cap on vouchers examined (default 2000); the output flags when it was hit.", { minimum: 1, maximum: 20000 }),
       extensions: {
         type: "array",
         items: { type: "string" },
@@ -897,9 +910,14 @@ const diffReceiptFolder: ToolDef = {
     const info = await stat(target).catch(() => null);
     if (!info?.isDirectory()) throw new Error(`Not a directory: ${target}`);
 
-    const exts = (Array.isArray(args.extensions) ? (args.extensions as string[]) : [".pdf"]).map((e) =>
-      e.startsWith(".") ? e.toLowerCase() : `.${e.toLowerCase()}`,
-    );
+    const rawExts: unknown[] = Array.isArray(args.extensions) ? args.extensions : [".pdf"];
+    if (!rawExts.every((e): e is string => typeof e === "string" && e.trim() !== "")) {
+      throw new Error("extensions must be a list of non-empty strings, e.g. ['.pdf'].");
+    }
+    const exts = rawExts.map((e) => {
+      const x = (e as string).trim().toLowerCase();
+      return x.startsWith(".") ? x : `.${x}`;
+    });
     const recursive = optBool(args, "recursive") ?? false;
 
     const files: string[] = [];
@@ -919,8 +937,10 @@ const diffReceiptFolder: ToolDef = {
 
     const parsed = files.map((f) => parseReceiptFilename(f));
     const period = readPeriod(args);
-    const tolerance = (optNumber(args, "dayTolerance") ?? 5) * DAY_MS;
-    const vouchers = await fetchVouchers(ctx, period, 2000);
+    const tolerance = optRange(args, "dayTolerance", 5, 0, 366) * DAY_MS;
+    const maxVouchers = optLimit(args, "maxVouchers", 2000, 20_000);
+    // A hidden voucher would be reported below as "has no file".
+    const { vouchers, truncated } = await fetchVouchersCapped(ctx, period, maxVouchers);
 
     const matchedVoucherIds = new Set<string>();
     const unmatchedFiles: Row[] = [];
@@ -969,6 +989,14 @@ const diffReceiptFolder: ToolDef = {
       directory: target,
       filesScanned: files.length,
       vouchersExamined: vouchers.length,
+      truncated,
+      ...(truncated
+        ? {
+            warning:
+              `Fetched only the first ${maxVouchers} vouchers: vouchersWithoutFile may be incomplete and ` +
+              "files may be wrongly listed as unmatched. Narrow from/to or raise maxVouchers.",
+          }
+        : {}),
       matched: matchedVoucherIds.size,
       filesWithoutVoucher: { count: unmatchedFiles.length, items: unmatchedFiles },
       vouchersWithoutFile: { count: vouchersWithoutFile.length, items: vouchersWithoutFile },
@@ -1003,14 +1031,14 @@ const reconcileTransactions: ToolDef = {
     properties: {
       from: str("Start of period, dd.mm.yyyy or yyyy-mm-dd."),
       to: str("End of period, dd.mm.yyyy or yyyy-mm-dd."),
-      dayWindow: int("Maximum days between payment and voucher date to still count as a match (default 5)."),
+      dayWindow: int("Maximum days between payment and voucher date to still count as a match (default 5, 0-366).", { minimum: 0, maximum: 366 }),
       maxItems: int("Safety cap per side (default 2000).", { minimum: 1, maximum: 20000 }),
     },
     additionalProperties: false,
   },
   async handler(args, ctx) {
     const period = readPeriod(args);
-    const window = optNumber(args, "dayWindow") ?? 5;
+    const window = optRange(args, "dayWindow", 5, 0, 366);
     const maxItems = optLimit(args, "maxItems", 2000, 20_000);
 
     const [transactions, vouchers] = await Promise.all([

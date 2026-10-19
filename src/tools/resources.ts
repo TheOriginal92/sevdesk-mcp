@@ -18,10 +18,12 @@ import {
   bool,
   int,
   isDryRun,
+  isPlainObject,
   obj,
   optId,
   optLimit,
   optString,
+  positionObjects,
   requireId,
   requireString,
   str,
@@ -599,7 +601,7 @@ const createVoucher: ToolDef = {
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const positionsIn = Array.isArray(args.positions) ? (args.positions as Row[]) : [];
+    const positionsIn = positionObjects(args);
     if (!positionsIn.length) throw new Error("At least one position is required.");
 
     const status = optString(args, "status") ?? "50";
@@ -641,6 +643,9 @@ const createVoucher: ToolDef = {
     };
     // `extra` is for genuinely additional fields; it must not silently
     // override what the tool's own arguments and guards decided.
+    if (args.extra !== undefined && !isPlainObject(args.extra)) {
+      throw new Error("extra must be an object of additional voucher fields.");
+    }
     const extra = (args.extra ?? {}) as Row;
     // taxType / taxSet are legacy tax fields that would contradict taxRule.
     const collisions = Object.keys(extra).filter(
@@ -914,7 +919,7 @@ const createInvoice: ToolDef = {
   },
   async handler(args, ctx) {
     const contactId = requireId(args, "contactId");
-    const positions = Array.isArray(args.positions) ? (args.positions as Row[]) : [];
+    const positions = positionObjects(args);
     if (positions.length === 0) throw new Error("At least one position is required.");
 
     const ruleId = optString(args, "taxRuleId");
@@ -1034,6 +1039,8 @@ const getInvoicePdf: ToolDef = {
   async handler(args, ctx) {
     const id = requireId(args, "invoiceId");
     const dir = await assertAllowedPath(ctx, requireString(args, "directory"));
+    // Fail before the network call: a PDF fetched and then unwritable is a wasted (and, for sevDesk, logged) request.
+    if (!(await stat(dir).catch(() => null))?.isDirectory()) throw new Error(`Not a directory: ${dir}`);
 
     const { data } = await ctx.client.request<Row>({
       method: "GET",

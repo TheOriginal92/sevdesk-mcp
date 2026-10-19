@@ -135,6 +135,25 @@ export function optBool(args: Record<string, unknown>, key: string): boolean | u
   return undefined;
 }
 
+/** A number argument clamped to [min, max]; absent or non-numeric falls back to the default. */
+export function optRange(args: Record<string, unknown>, key: string, fallback: number, min: number, max: number): number {
+  const n = optNumber(args, key);
+  return Math.min(max, Math.max(min, n ?? fallback));
+}
+
+export function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/** The `positions` array with every entry checked to be an object — no raw TypeErrors later. */
+export function positionObjects(args: Record<string, unknown>): Record<string, unknown>[] {
+  const list = Array.isArray(args.positions) ? (args.positions as unknown[]) : [];
+  list.forEach((p, i) => {
+    if (!isPlainObject(p)) throw new Error(`Position ${i + 1}: must be an object.`);
+  });
+  return list as Record<string, unknown>[];
+}
+
 const ID_PATTERN = /^\d+$/;
 
 /**

@@ -59,6 +59,12 @@ function parseBaseUrl(raw: string): string {
         "localhost, 127.0.0.1 and [::1].",
     );
   }
+  if (url.search || url.hash || url.username || url.password) {
+    throw new Error(
+      "SEVDESK_BASE_URL must not carry a query string, fragment or credentials — " +
+        "the token goes in SEVDESK_API_TOKEN, and paths are appended to the base.",
+    );
+  }
   return raw.replace(/\/+$/, "");
 }
 
