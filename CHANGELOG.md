@@ -12,6 +12,10 @@
   `sevdesk_create_voucher`; the server does not guess a tax treatment.
   `sevdesk_create_voucher` also refuses a rule from the wrong side (an
   expense rule needs `creditDebit` C, a revenue rule D).
+- `sevdesk_set_tax_rule` now enforces its documented draft-only scope: open
+  and paid vouchers are refused before anything is sent (dry runs included)
+  instead of relying on the API to reject the update. Found in a live
+  read-only/dry-run check, where a paid voucher still got a preview.
 
 **Security / hardening**
 

@@ -855,6 +855,14 @@ const setTaxRule: ToolDef = {
     const rule = TAX_RULES[target];
 
     const v = await fetchUnenshrined(ctx, "Voucher", id);
+    // Learned on live data: the API only updates drafts, and resetting a paid
+    // foreign-currency voucher recalculates its EUR amounts at today's rate.
+    if (String(v.status) !== "50") {
+      throw new Error(
+        `Refused: voucher ${id} is ${VOUCHER_STATUS[String(v.status)] ?? `status ${v.status}`}, not a ` +
+          "draft (Entwurf). Change the tax rule of booked or paid vouchers in the sevDesk UI.",
+      );
+    }
     const before = readTaxTreatment(v);
     const side = voucherSide(v) ?? rule.side;
     if (side !== rule.side) {

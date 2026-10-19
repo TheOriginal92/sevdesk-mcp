@@ -121,7 +121,7 @@ describe("sevdesk_set_tax_rule", () => {
   const baseVoucher = (): Row => ({
     id: "42",
     creditDebit: "C",
-    status: "100",
+    status: "50",
     supplierName: "Acme Cloud, Inc.",
     voucherDate: "2026-06-01",
     sumGross: 100,
@@ -158,6 +158,17 @@ describe("sevdesk_set_tax_rule", () => {
     const { ctx, sent } = voucherCtx({ ...baseVoucher(), enshrined: "2026-07-01T00:00:00+02:00" });
     await expect(setTaxRule.handler({ voucherId: "42", taxRuleId: "12" }, ctx)).rejects.toThrow(
       /enshrined|festgeschrieben/i,
+    );
+    expect(sent).toEqual([]);
+  });
+
+  it.each(["100", "1000"])("refuses a non-draft voucher (status %s), even as a dry run", async (status) => {
+    const { ctx, sent } = voucherCtx({ ...baseVoucher(), status });
+    await expect(
+      setTaxRule.handler({ voucherId: "42", taxRuleId: "12", dryRun: true }, ctx),
+    ).rejects.toThrow(/not a draft/);
+    await expect(setTaxRule.handler({ voucherId: "42", taxRuleId: "12" }, ctx)).rejects.toThrow(
+      /not a draft/,
     );
     expect(sent).toEqual([]);
   });
