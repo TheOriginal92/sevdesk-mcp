@@ -159,7 +159,7 @@ Everything runs locally: your token and accounting data flow only between your M
 
 ## Write safety
 
-Read-only mode is enforced three times: write tools are hidden from the tool list, the dispatcher refuses them, and the HTTP client refuses every mutating request independently. With writes enabled:
+Read-only mode is enforced three times: write tools are hidden from the tool list, the dispatcher refuses them, and the HTTP client refuses every mutating request independently. `sevdesk_call` treats GETs that change state (`sendByWithRender`, a truthy `enshrine*` flag, `preventSendBy` turned off) as writes. With writes enabled:
 
 - Every write tool accepts a per-call `dryRun` and honors the global `SEVDESK_DRY_RUN`.
 - `sevdesk_create_voucher` and `sevdesk_create_invoice` default to **drafts** — nothing is booked or sent silently.

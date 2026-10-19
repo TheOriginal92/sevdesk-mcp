@@ -99,6 +99,7 @@ const callOperation: ToolDef = {
     "the server runs with SEVDESK_READ_ONLY=true, and are only described (not sent) when " +
     "SEVDESK_DRY_RUN=true or `dryRun` is passed. Operations with a `preventSendBy` query " +
     "parameter (the *GetPdf reads) default it to true so a read does not mark the document as sent. " +
+    "GETs that change state (sendByWithRender, enshrine flags, preventSendBy=false) count as writes. " +
     "Can call DELETE operations, which are irreversible.",
   mutating: true,
   destructive: true, // conservatively declared; the handler checks per operation
@@ -125,7 +126,12 @@ const callOperation: ToolDef = {
     }
 
     const params = (args.params ?? {}) as Record<string, unknown>;
-    const body = args.body;
+    // null / {} carry nothing; treat them as "no body" so a harmless filler
+    // value does not fail a GET.
+    const emptyBody =
+      args.body === null ||
+      (typeof args.body === "object" && !Array.isArray(args.body) && Object.keys(args.body as object).length === 0);
+    const body = emptyBody ? undefined : args.body;
 
     if (op.mutating && ctx.config.readOnly) throw new ReadOnlyError(op.operationId);
 
@@ -163,21 +169,33 @@ const callOperation: ToolDef = {
       if (!pathParamNames.has(k)) query[k] = v;
     }
 
-    // Some GETs change state: the *GetPdf operations mark the document as sent
-    // unless preventSendBy is true. A read must stay a read, so default it on,
-    // and refuse turning it off while the server is read-only.
+    // Some GETs change state, and the catalog calls every GET a read. Without
+    // this, SEVDESK_READ_ONLY and dryRun would let them through:
+    //  - *GetPdf marks the document as sent unless preventSendBy is true, so
+    //    default it on (absent or null) and send a literal true;
+    //  - sendByWithRender sends/marks a document;
+    //  - enshrine* flags (Festschreibung) are irreversible when truthy. Only
+    //    flags that start with "enshrine" count: includeEnshrined and
+    //    withEnshrinedDocuments are read filters.
+    let effectiveMutating = op.mutating;
     if (op.params.some((p) => p.in === "query" && p.name === "preventSendBy")) {
-      if (query.preventSendBy === undefined) {
+      const v = query.preventSendBy;
+      if (v === undefined || v === null || optBool(query, "preventSendBy") === true) {
         query.preventSendBy = true;
-      } else if (ctx.config.readOnly && optBool(query, "preventSendBy") !== true) {
-        throw new Error(
-          `Refused: ${op.operationId} with preventSendBy=false marks the document as sent, but the ` +
-            "server runs with SEVDESK_READ_ONLY=true. Unset that variable to allow it.",
-        );
+      } else {
+        effectiveMutating = true; // explicitly turned off: the document gets marked as sent
       }
     }
+    if (op.path.endsWith("/sendByWithRender")) effectiveMutating = true;
+    for (const p of op.params) {
+      if (p.in !== "query" || !/^enshrine/i.test(p.name)) continue;
+      const v = params[p.name];
+      // Unparseable non-empty values count as set: fail safe.
+      if (v !== undefined && v !== null && v !== "" && optBool(params, p.name) !== false) effectiveMutating = true;
+    }
+    if (effectiveMutating && ctx.config.readOnly) throw new ReadOnlyError(op.operationId);
 
-    if (isDryRun(args, ctx) && op.mutating) {
+    if (isDryRun(args, ctx) && effectiveMutating) {
       return {
         dryRun: true,
         wouldSend: {
@@ -195,7 +213,7 @@ const callOperation: ToolDef = {
       path: filledPath,
       query: Object.keys(query).length ? query : undefined,
       body,
-      mutating: op.mutating,
+      mutating: effectiveMutating,
     });
     return { status: result.status, data: result.data };
   },

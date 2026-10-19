@@ -158,7 +158,7 @@ Alles läuft lokal: Token und Buchhaltungsdaten fließen ausschließlich zwische
 
 ## Schreibsicherheit
 
-Der Nur-Lesen-Modus greift dreifach: Schreib-Tools verschwinden aus der Tool-Liste, der Dispatcher verweigert sie, und der HTTP-Client verweigert jede schreibende Anfrage unabhängig davon. Mit aktivierten Schreibzugriffen:
+Der Nur-Lesen-Modus greift dreifach: Schreib-Tools verschwinden aus der Tool-Liste, der Dispatcher verweigert sie, und der HTTP-Client verweigert jede schreibende Anfrage unabhängig davon. `sevdesk_call` behandelt zustandsändernde GETs (`sendByWithRender`, ein gesetztes `enshrine*`-Flag, abgeschaltetes `preventSendBy`) als Schreibzugriffe. Mit aktivierten Schreibzugriffen:
 
 - Jedes Schreib-Tool akzeptiert ein `dryRun` pro Aufruf und beachtet das globale `SEVDESK_DRY_RUN`.
 - `sevdesk_create_voucher` und `sevdesk_create_invoice` erstellen **Entwürfe** — nichts wird stillschweigend gebucht oder versendet.

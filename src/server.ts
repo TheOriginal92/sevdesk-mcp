@@ -10,9 +10,13 @@ export const MAX_OUTPUT_CHARS = 200_000;
 
 export function capOutput(text: string): string {
   if (text.length <= MAX_OUTPUT_CHARS) return text;
+  // Do not cut between the halves of a surrogate pair (emoji etc.).
+  let cut = MAX_OUTPUT_CHARS;
+  const unit = text.charCodeAt(cut - 1);
+  if (unit >= 0xd800 && unit <= 0xdbff) cut--;
   return (
-    text.slice(0, MAX_OUTPUT_CHARS) +
-    `\n\n[Output truncated at ${MAX_OUTPUT_CHARS} of ${text.length} characters. ` +
+    text.slice(0, cut) +
+    `\n\n[Output truncated at ${cut} of ${text.length} characters. ` +
     "Narrow the request: a smaller limit/offset, a date range or filters.]"
   );
 }

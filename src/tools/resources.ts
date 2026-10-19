@@ -1,5 +1,5 @@
 import { readFile, stat, writeFile } from "node:fs/promises";
-import { basename, extname, join } from "node:path";
+import { basename, extname, join, resolve } from "node:path";
 
 import {
   INVOICE_STATUS,
@@ -122,7 +122,7 @@ const listVouchers: ToolDef = {
       to: str("End date, dd.mm.yyyy or yyyy-mm-dd."),
       supplier: str("Case-insensitive substring of the supplier name."),
       status: str("Filter by status.", { enum: ["Entwurf", "offen", "bezahlt"] }),
-      limit: int("Maximum rows to return (default 200)."),
+      limit: int("Maximum rows to return (default 200).", { minimum: 1, maximum: 1000 }),
     },
     additionalProperties: false,
   },
@@ -236,7 +236,7 @@ const listInvoices: ToolDef = {
     properties: {
       from: str("Start date."),
       to: str("End date."),
-      limit: int("Maximum rows (default 200)."),
+      limit: int("Maximum rows (default 200).", { minimum: 1, maximum: 1000 }),
     },
     additionalProperties: false,
   },
@@ -263,7 +263,7 @@ const listInvoices: ToolDef = {
         };
       })
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
-    return { total: rows.length, invoices: rows.slice(0, limit) };
+    return { total: rows.length, returned: Math.min(rows.length, limit), invoices: rows.slice(0, limit) };
   },
 };
 
@@ -290,6 +290,7 @@ const summarize: ToolDef = {
       }),
       maxGroups: int(
         "Cap on returned groups; the remainder is folded into one '(andere)' entry (default 40).",
+        { minimum: 1, maximum: 1000 },
       ),
     },
     required: ["kind"],
@@ -407,7 +408,7 @@ const listContacts: ToolDef = {
     type: "object",
     properties: {
       search: str("Case-insensitive substring of the contact name."),
-      limit: int("Maximum rows (default 200)."),
+      limit: int("Maximum rows (default 200).", { minimum: 1, maximum: 1000 }),
     },
     additionalProperties: false,
   },
@@ -424,7 +425,7 @@ const listContacts: ToolDef = {
         taxNumber: c.taxNumber ?? null,
       }))
       .filter((c) => !search || String(c.name).toLowerCase().includes(search));
-    return { total: rows.length, contacts: rows.slice(0, limit) };
+    return { total: rows.length, returned: Math.min(rows.length, limit), contacts: rows.slice(0, limit) };
   },
 };
 
@@ -439,7 +440,7 @@ const listTransactions: ToolDef = {
       checkAccountId: str("Restrict to one bank account id."),
       from: str("Start date."),
       to: str("End date."),
-      limit: int("Maximum rows (default 200)."),
+      limit: int("Maximum rows (default 200).", { minimum: 1, maximum: 1000 }),
     },
     additionalProperties: false,
   },
@@ -467,7 +468,7 @@ const listTransactions: ToolDef = {
         };
       })
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
-    return { total: rows.length, transactions: rows.slice(0, limit) };
+    return { total: rows.length, returned: Math.min(rows.length, limit), transactions: rows.slice(0, limit) };
   },
 };
 
@@ -499,18 +500,21 @@ const uploadVoucherFile: ToolDef = {
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const path = await assertAllowedPath(ctx, requireString(args, "filePath"));
+    const requested = resolve(requireString(args, "filePath"));
+    // Containment and I/O use the real path; the name and content type come
+    // from what the caller asked for, so an allowlisted alias.pdf link works.
+    const path = await assertAllowedPath(ctx, requested);
     const info = await stat(path).catch(() => null);
     if (!info?.isFile()) throw new Error(`Not a file: ${path}`);
     if (info.size > 20 * 1024 * 1024) throw new Error("File is larger than 20 MB.");
 
     // XML covers XRechnung / ZUGFeRD e-invoices. No fallback type: a wrong
     // guess is stored as-is, so an unknown extension must be stated explicitly.
-    const guessed = MIME_BY_EXT[extname(path).toLowerCase()];
+    const guessed = MIME_BY_EXT[extname(requested).toLowerCase()];
     const mime = optString(args, "mimeType") ?? guessed;
     if (!mime) {
       throw new Error(
-        `Refused: cannot tell the content type of '${basename(path)}'. Known extensions: ` +
+        `Refused: cannot tell the content type of '${basename(requested)}'. Known extensions: ` +
           `${Object.keys(MIME_BY_EXT).join(", ")} — or pass mimeType explicitly.`,
       );
     }
@@ -518,13 +522,13 @@ const uploadVoucherFile: ToolDef = {
     if (isDryRun(args, ctx)) {
       return {
         dryRun: true,
-        wouldSend: { method: "POST", path: "/Voucher/Factory/uploadTempFile", file: path, bytes: info.size, mime },
+        wouldSend: { method: "POST", path: "/Voucher/Factory/uploadTempFile", file: requested, bytes: info.size, mime },
       };
     }
 
     const bytes = await readFile(path);
     const form = new FormData();
-    form.append("file", new Blob([new Uint8Array(bytes)], { type: mime }), basename(path));
+    form.append("file", new Blob([new Uint8Array(bytes)], { type: mime }), basename(requested));
 
     const { data } = await ctx.client.request<Row>({
       method: "POST",
@@ -542,7 +546,7 @@ const uploadVoucherFile: ToolDef = {
       delete meta.content;
       response = { objects: meta };
     }
-    return { uploaded: basename(path), bytes: info.size, response };
+    return { uploaded: basename(requested), bytes: info.size, response };
   },
 };
 
@@ -599,7 +603,11 @@ const createVoucher: ToolDef = {
     if (!positionsIn.length) throw new Error("At least one position is required.");
 
     const status = optString(args, "status") ?? "50";
-    const creditDebit = optString(args, "creditDebit") === "D" ? "D" : "C";
+    const cdRaw = optString(args, "creditDebit");
+    if (cdRaw !== undefined && cdRaw !== "C" && cdRaw !== "D") {
+      throw new Error(`creditDebit must be "C" or "D", not "${cdRaw}".`);
+    }
+    const creditDebit = cdRaw ?? "C";
     const taxRuleId = optString(args, "taxRuleId");
     if (!taxRuleId) {
       throw new Error(
@@ -634,7 +642,10 @@ const createVoucher: ToolDef = {
     // `extra` is for genuinely additional fields; it must not silently
     // override what the tool's own arguments and guards decided.
     const extra = (args.extra ?? {}) as Row;
-    const collisions = Object.keys(extra).filter((k) => base[k] !== undefined);
+    // taxType / taxSet are legacy tax fields that would contradict taxRule.
+    const collisions = Object.keys(extra).filter(
+      (k) => base[k] !== undefined || k === "taxType" || k === "taxSet",
+    );
     if (collisions.length) {
       throw new Error(
         `Refused: extra would override field(s) this tool sets itself: ${collisions.join(", ")}. ` +
@@ -642,6 +653,11 @@ const createVoucher: ToolDef = {
       );
     }
     const voucher: Row = { ...base, ...extra };
+
+    const netFlags = new Set(positionsIn.map((p) => p.sumNet !== undefined && p.sumNet !== null));
+    if (netFlags.size > 1) {
+      throw new Error("Refused: positions mix sumNet and sumGross — a voucher is either all net or all gross.");
+    }
 
     const voucherPosSave = positionsIn.map((p, i) => {
       const at = `Position ${i + 1}`;
@@ -725,7 +741,7 @@ const receiptGuidance: ToolDef = {
       query: str("Case-insensitive substring over account number, name and description."),
       accountNumber: str("Exact SKR account number, e.g. '6837'."),
       taxRuleId: str("Only accounts that allow this tax rule id, e.g. '12'."),
-      limit: int("Maximum accounts to return (default 20)."),
+      limit: int("Maximum accounts to return (default 20).", { minimum: 1, maximum: 1000 }),
     },
     additionalProperties: false,
   },

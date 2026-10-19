@@ -284,3 +284,86 @@ describe("sevdesk_upload_voucher_file mime types", () => {
     expect(await mimeOf("a.heic", { mimeType: "image/heic" })).toBe("image/heic");
   });
 });
+
+describe("sevdesk_call body and preventSendBy edge cases", () => {
+  const call = tool("sevdesk_call");
+  function ctx() {
+    const sent: Array<{ query?: Row; body?: unknown; mutating?: boolean }> = [];
+    return {
+      sent,
+      ctx: {
+        client: {
+          async request(o: { query?: Row; body?: unknown; mutating?: boolean }) {
+            sent.push(o);
+            return { status: 200, data: {} };
+          },
+        },
+        config: { readOnly: false, dryRun: false, baseUrl: "https://example.test/api/v1" },
+      } as unknown as ToolContext,
+    };
+  }
+
+  it("treats null and {} bodies as absent on a GET, but refuses a real body", async () => {
+    const { ctx: c, sent } = ctx();
+    await call.handler({ operationId: "invoiceGetPdf", params: { invoiceId: 1 }, body: null }, c);
+    await call.handler({ operationId: "invoiceGetPdf", params: { invoiceId: 1 }, body: {} }, c);
+    expect(sent.every((s) => s.body === undefined)).toBe(true);
+    await expect(
+      call.handler({ operationId: "invoiceGetPdf", params: { invoiceId: 1 }, body: { a: 1 } }, c),
+    ).rejects.toThrow(/no request body/);
+  });
+
+  it("defaults a null preventSendBy and normalizes truthy strings to a literal true", async () => {
+    const { ctx: c, sent } = ctx();
+    for (const v of [null, "yes", "1", "true"]) {
+      await call.handler({ operationId: "invoiceGetPdf", params: { invoiceId: 1, preventSendBy: v } }, c);
+    }
+    expect(sent.map((s) => s.query?.preventSendBy)).toEqual([true, true, true, true]);
+    expect(sent.every((s) => s.mutating === false)).toBe(true);
+  });
+
+  it("passes mutating=true to the client for state-changing GETs", async () => {
+    const { ctx: c, sent } = ctx();
+    await call.handler({ operationId: "exportDatevCSV", params: { enshrineDocuments: true } }, c);
+    expect(sent[0]!.mutating).toBe(true);
+  });
+});
+
+describe("remaining create_voucher / upload guards", () => {
+  const create = tool("sevdesk_create_voucher");
+  const c = { client: {}, config: { readOnly: false, dryRun: true } } as unknown as ToolContext;
+  const base = { supplierName: "A", voucherDate: "01.09.2026", taxRuleId: "9" };
+
+  it("refuses a rule that is not usable on vouchers (rule 18 on a D voucher)", async () => {
+    await expect(
+      create.handler({ ...base, taxRuleId: "18", creditDebit: "D", positions: [{ sumNet: 1, taxRate: 19 }] }, c),
+    ).rejects.toThrow(/not usable on a voucher/);
+  });
+
+  it("refuses mixed net/gross positions and unknown creditDebit values", async () => {
+    await expect(
+      create.handler({ ...base, positions: [{ sumNet: 1, taxRate: 19 }, { sumGross: 2, taxRate: 19 }] }, c),
+    ).rejects.toThrow(/mix sumNet and sumGross/);
+    await expect(
+      create.handler({ ...base, creditDebit: "d", positions: [{ sumNet: 1, taxRate: 19 }] }, c),
+    ).rejects.toThrow(/creditDebit must be/);
+  });
+
+  it("refuses extra.taxType / extra.taxSet", async () => {
+    await expect(
+      create.handler({ ...base, positions: [{ sumNet: 1, taxRate: 19 }], extra: { taxType: "default" } }, c),
+    ).rejects.toThrow(/taxType/);
+  });
+
+  it("uploads an allowlisted symlink named .pdf that points at an extension-less file", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sevdesk-mcp-alias-"));
+    await writeFile(join(root, "scan"), "x");
+    await symlink(join(root, "scan"), join(root, "alias.pdf"));
+    const cx = { client: {}, config: { readOnly: false, dryRun: true, allowedReceiptDirs: [root] } } as unknown as ToolContext;
+    const out = (await tool("sevdesk_upload_voucher_file").handler({ filePath: join(root, "alias.pdf") }, cx)) as {
+      wouldSend: { mime: string; file: string };
+    };
+    expect(out.wouldSend.mime).toBe("application/pdf");
+    expect(out.wouldSend.file).toBe(join(root, "alias.pdf"));
+  });
+});
