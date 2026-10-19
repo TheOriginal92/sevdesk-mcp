@@ -15,6 +15,49 @@
   `sevdesk_create_voucher` also refuses a rule from the wrong side (an
   expense rule needs `creditDebit` C, a revenue rule D).
 
+**Security / hardening**
+
+Behaviour changes that can break existing callers are marked **(breaking)**.
+
+- **(breaking)** `SEVDESK_BASE_URL` must be `https://`; `http://` is accepted
+  only for `localhost`, `127.0.0.1` and `[::1]`. The server refuses to start
+  otherwise — the token is sent as a header.
+- **(breaking)** `SEVDESK_RECEIPT_DIRS` is split on the platform path
+  delimiter (`;` on Windows, so `C:\…` works) and relative entries are
+  refused at startup.
+- Redirects are no longer followed (`redirect: "manual"`); a 3xx becomes a
+  non-retried `SevdeskApiError`, since following it would replay a write to
+  an unconfigured URL.
+- A GET/HEAD with a body is refused up front instead of being retried as a
+  network error; `sevdesk_call` also refuses a `body` on GET operations.
+- **(breaking)** Ids (`voucherId`, `invoiceId`, `contactId`, `checkAccountId`,
+  position `accountingTypeId`) must be numeric (number or digit string), and
+  `sevdesk_call` requires numeric path parameters. `.` and `..` are refused
+  as path parameters.
+- `limit`, `maxVouchers`, `maxItems`, `maxGroups` are floored and clamped to
+  `[1, max]` (list limits 1000, `maxVouchers`/`maxItems` 20,000). A negative
+  or huge value no longer slices off the wrong rows or walks the whole ledger.
+- The receipt allowlist resolves symlinks on both sides and returns the real
+  path; the target must exist.
+- `sevdesk_call` is annotated `destructiveHint: true` (new `ToolDef.destructive`);
+  all other tools stay `false`.
+- `sevdesk_call` defaults `preventSendBy` to true on `invoiceGetPdf`,
+  `creditNoteGetPdf` and `orderGetPdf` (derived from the catalog), and refuses
+  `preventSendBy=false` under `SEVDESK_READ_ONLY=true`.
+- **(breaking)** `sevdesk_create_voucher` requires a numeric `taxRate` and
+  exactly one of `sumNet` / `sumGross` per position, checks the rate against
+  the tax rule's allowed rates, and refuses `extra` keys that collide with
+  fields the tool sets (`status`, `taxRule`, `creditDebit`, `voucherDate`,
+  `supplierName`, `objectName`, `mapAll`, `voucherType`, and `description` /
+  `payDate` when given).
+- **(breaking)** `sevdesk_create_invoice` requires a finite numeric `price` and
+  a non-empty position `name`.
+- **(breaking)** `sevdesk_upload_voucher_file` maps `.xml` (XRechnung /
+  ZUGFeRD) to `application/xml` and `.jpg`/`.jpeg` to `image/jpeg`; other
+  extensions are refused unless `mimeType` is passed (it used to guess JPEG).
+- Tool output is capped at 200,000 characters, with a closing line saying how
+  much was cut.
+
 **Fixed** (thanks @TheOriginal92, PR #2)
 
 - `sevdesk_create_voucher` attaches the uploaded receipt via the

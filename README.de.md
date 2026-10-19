@@ -134,8 +134,8 @@ des Servers und die Tool-Beschreibungen tragen das Wesentliche.
 | `SEVDESK_API_TOKEN` | *(erforderlich)* | Dein sevDesk-API-Token |
 | `SEVDESK_READ_ONLY` | `false` | Blendet Schreib-Tools aus; `sevdesk_call` bleibt sichtbar, verweigert aber schreibende Operationen beim Aufruf |
 | `SEVDESK_DRY_RUN` | `false` | Zeigt, was ein Schreibzugriff senden *würde*, ohne zu senden |
-| `SEVDESK_RECEIPT_DIRS` | *(nicht gesetzt — Datei-Tools deaktiviert)* | Doppelpunkt-getrennte Positivliste der Verzeichnisse für die Beleg-Datei-Tools |
-| `SEVDESK_BASE_URL` | `https://my.sevdesk.de/api/v1` | API-Host überschreiben |
+| `SEVDESK_RECEIPT_DIRS` | *(nicht gesetzt — Datei-Tools deaktiviert)* | Positivliste **absoluter** Verzeichnisse für die Beleg-Datei-Tools, getrennt durch das Pfadtrennzeichen der Plattform (`:` unter macOS/Linux, `;` unter Windows). Symlinks werden aufgelöst; ein Link, der aus der Liste hinausführt, wird abgelehnt |
+| `SEVDESK_BASE_URL` | `https://my.sevdesk.de/api/v1` | API-Host überschreiben. Muss `https://` sein (das Token wird als Header gesendet); `http://` ist nur für `localhost`, `127.0.0.1` und `[::1]` erlaubt |
 | `SEVDESK_TIMEOUT_MS` | `30000` | Timeout pro Anfrage |
 | `SEVDESK_MAX_RETRIES` | `3` | Wiederholungen mit gejittertem Backoff und begrenztem `Retry-After`. Ein 429 wird immer wiederholt (der gedrosselte Aufruf lief nie); ein 5xx oder Netzwerkfehler nur bei **Lesezugriffen** — ein Schreibzugriff wird bei unklarem Ausgang nie erneut gesendet, ein Timeout kann also keinen doppelten Entwurf erzeugen |
 | `SEVDESK_RATE_LIMIT` | `4` | Clientseitige Drosselung in Requests/Sekunde (Token-Bucket), damit Audit-Abfragesalven nicht mit sevDesks Limit kollidieren. `0` deaktiviert |
