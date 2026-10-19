@@ -25,11 +25,16 @@ interface StubData {
  */
 function stubCtx(d: StubData, config: Record<string, unknown> = {}): ToolContext {
   const client = {
-    async getAll(path: string): Promise<Row[]> {
+    async getAll(path: string, query?: Record<string, unknown>): Promise<Row[]> {
       if (path === "/Voucher") return d.vouchers ?? [];
       if (path === "/Contact") return d.contacts ?? [];
       if (path === "/CheckAccountTransaction") return d.transactions ?? [];
       if (path === "/Invoice") return d.invoices ?? [];
+      if (path === "/VoucherPos") {
+        const id = String(query?.["voucher[id]"] ?? "");
+        if (d.failingPositionIds?.includes(id)) throw new Error("boom");
+        return d.positionsByVoucher?.[id] ?? [];
+      }
       return [];
     },
     async request(opts: { path: string; query?: Record<string, unknown> }) {

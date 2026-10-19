@@ -251,6 +251,6 @@ describe("config parsing", () => {
     expect(loadConfig({ SEVDESK_API_TOKEN: "t" }).rateLimitPerSec).toBe(4);
     expect(loadConfig({ SEVDESK_API_TOKEN: "t", SEVDESK_RATE_LIMIT: "0" }).rateLimitPerSec).toBe(0);
     expect(loadConfig({ SEVDESK_API_TOKEN: "t", SEVDESK_RATE_LIMIT: "2.5" }).rateLimitPerSec).toBe(2.5);
-    expect(loadConfig({ SEVDESK_API_TOKEN: "t", SEVDESK_RATE_LIMIT: "nope" }).rateLimitPerSec).toBe(4);
+    expect(() => loadConfig({ SEVDESK_API_TOKEN: "t", SEVDESK_RATE_LIMIT: "nope" })).toThrow(/SEVDESK_RATE_LIMIT/);
   });
 });

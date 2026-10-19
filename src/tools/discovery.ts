@@ -7,7 +7,7 @@ import {
 } from "../catalog.js";
 import { SevdeskClient } from "../client.js";
 import { ReadOnlyError } from "../config.js";
-import { bool, isDryRun, obj, optBool, optLimit, optString, requireString, str, type ToolDef } from "../lib/tool.js";
+import { bool, isDryRun, obj, optLimit, optString, requireString, str, strictBool, type ToolDef } from "../lib/tool.js";
 
 /**
  * Three tools that together expose the *entire* sevDesk API.
@@ -180,20 +180,18 @@ const callOperation: ToolDef = {
     //    withEnshrinedDocuments are read filters.
     let effectiveMutating = op.mutating;
     if (op.params.some((p) => p.in === "query" && p.name === "preventSendBy")) {
-      const v = query.preventSendBy;
-      if (v === undefined || v === null || optBool(query, "preventSendBy") === true) {
-        query.preventSendBy = true;
-      } else {
-        effectiveMutating = true; // explicitly turned off: the document gets marked as sent
-      }
+      // Normalized to a literal boolean; an unparseable value is refused, not forwarded.
+      const flag = strictBool(query, "preventSendBy") ?? true;
+      query.preventSendBy = flag;
+      if (!flag) effectiveMutating = true; // explicitly turned off: the document gets marked as sent
     }
     if (op.path.endsWith("/sendByWithRender")) effectiveMutating = true;
     for (const p of op.params) {
       if (p.in !== "query" || !/^enshrine/i.test(p.name)) continue;
-      const v = params[p.name];
-      // Unparseable non-empty values count as set: fail safe.
-      if (v === undefined || v === null || v === "" || v === 0) continue;
-      if (optBool(params, p.name) !== false) effectiveMutating = true;
+      const flag = strictBool(params, p.name);
+      if (flag === undefined) continue;
+      query[p.name] = flag;
+      if (flag) effectiveMutating = true;
     }
     if (effectiveMutating && ctx.config.readOnly) throw new ReadOnlyError(op.operationId);
 

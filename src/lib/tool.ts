@@ -43,7 +43,8 @@ export interface ToolDef {
 
 /** One rule for every write tool: a per-call dryRun argument or the global flag. */
 export function isDryRun(args: Record<string, unknown>, ctx: ToolContext): boolean {
-  return (optBool(args, "dryRun") ?? false) || ctx.config.dryRun;
+  // Strict: an unparseable value must never fall through to a real write.
+  return (strictBool(args, "dryRun") ?? false) || ctx.config.dryRun;
 }
 
 /**
@@ -132,14 +133,31 @@ export function optNumber(args: Record<string, unknown>, key: string): number | 
   return undefined;
 }
 
+/**
+ * Booleans as models actually send them: true/false, 1/0, and trimmed,
+ * case-insensitive strings. Anything else is `undefined` (see {@link isDryRun}
+ * for where that matters).
+ */
 export function optBool(args: Record<string, unknown>, key: string): boolean | undefined {
   const v = args[key];
   if (typeof v === "boolean") return v;
+  if (v === 1) return true;
+  if (v === 0) return false;
   if (typeof v === "string") {
-    if (["true", "1", "yes"].includes(v.toLowerCase())) return true;
-    if (["false", "0", "no"].includes(v.toLowerCase())) return false;
+    const t = v.trim().toLowerCase();
+    if (["true", "1", "yes", "on"].includes(t)) return true;
+    if (["false", "0", "no", "off"].includes(t)) return false;
   }
   return undefined;
+}
+
+/** Like optBool, but a present value that is not a boolean is refused rather than guessed. */
+export function strictBool(args: Record<string, unknown>, key: string): boolean | undefined {
+  const v = args[key];
+  if (v === undefined || v === null || (typeof v === "string" && v.trim() === "")) return undefined;
+  const b = optBool(args, key);
+  if (b === undefined) throw new Error(`${key} must be true or false.`);
+  return b;
 }
 
 export function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -208,3 +226,33 @@ export function optRuleId(args: Record<string, unknown>, key = "taxRuleId"): str
   return optString(args, key);
 }
 
+
+/** All rows of a collection, capped; one extra row tells "exactly at the cap" from "more behind it". */
+export async function getAllCapped<T = Record<string, unknown>>(
+  ctx: ToolContext,
+  path: string,
+  query: Record<string, unknown>,
+  cap: number,
+): Promise<{ rows: T[]; truncated: boolean }> {
+  const all = await ctx.client.getAll<T>(path, query, { maxItems: cap + 1 });
+  return { rows: all.slice(0, cap), truncated: all.length > cap };
+}
+
+/**
+ * `{ truncated }`, plus a warning naming the right noun and the argument to
+ * raise when the cap cut the data. The cap applies before any date/status
+ * filtering, so the requested range itself may be incomplete.
+ */
+export function truncationFields(
+  truncated: boolean,
+  o: { what: string; cap: number; param?: string },
+): { truncated: boolean; warning?: string } {
+  if (!truncated) return { truncated };
+  return {
+    truncated,
+    warning:
+      `Only the first ${o.cap} ${o.what} were fetched, before any filtering, so rows in the ` +
+      `requested range may be missing. ` +
+      (o.param ? `Raise ${o.param}.` : "Narrow the request (from/to, filters)."),
+  };
+}

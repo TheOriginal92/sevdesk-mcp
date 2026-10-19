@@ -83,6 +83,31 @@ Behaviour changes that can break existing callers are marked **(breaking)**.
   `invoice-<id>.pdf` for an empty or dot-only API filename. The base URL is
   rebuilt from the parsed URL (a bare `?`/`#` is dropped).
 - Release workflow verifies the pinned `mcp-publisher` checksum before `npm publish`.
+- **(breaking)** `SEVDESK_READ_ONLY`, `SEVDESK_DRY_RUN` and `SEVDESK_DEBUG`
+  accept `1/true/yes/on` and `0/false/no/off` (trimmed, any case; empty = default)
+  and **refuse to start** on anything else, instead of silently reading it as
+  false. `SEVDESK_MAX_RETRIES=0` now means no retries (it used to fall back to
+  3); invalid numbers in `SEVDESK_MAX_RETRIES`, `SEVDESK_TIMEOUT_MS` and
+  `SEVDESK_RATE_LIMIT` also fail at startup.
+- **(breaking)** An unparseable per-call `dryRun` (e.g. `"dry"`, `2`) is refused
+  with "dryRun must be true or false." instead of becoming a real write;
+  `1`, `0` and `" TRUE "` are understood. `sevdesk_call` likewise refuses
+  unparseable `preventSendBy` / `enshrine*` values and sends literal booleans.
+- **(breaking)** `sevdesk_upload_voucher_file` again refuses relative paths
+  (the check now runs before the path is resolved).
+- `sevdesk_create_invoice` validates explicit position rates against the tax
+  rule (rule 11 with 19 % is refused). The invoice-level rate and text follow
+  the positions when they agree (`Umsatzsteuer 7%`); when they differ the rule
+  default rate stays and the text is the rule label, since no single
+  percentage would be true.
+- The `sevdesk_list_*` tools, `sevdesk_summarize`, invoice aging and the contact
+  lookup behind the reverse-charge checks report `truncated` plus a warning
+  naming the right noun and the argument to raise. Voucher positions are
+  paged instead of cut at 200.
+- `sevdesk_get_invoice_pdf` only keeps API filenames that look like plain
+  `.pdf` names, else `invoice-<id>.pdf`.
+- Release workflow keeps `mcp-publisher` outside the checkout so it cannot end
+  up in the MCPB bundle (also listed in `.mcpbignore`).
 - Tool output is capped at 200,000 characters, with a closing line saying how
   much was cut.
 

@@ -114,7 +114,6 @@ describe("buildServer handlers", () => {
       ["sendCreditNoteByPrinting", { creditNoteId: 5 }],
       ["exportDatevCSV", { enshrineDocuments: true }],
       ["exportDatevDepricated", { enshrine: "true" }],
-      ["exportDatevDepricated", { enshrine: "maybe" }],
       ["invoiceGetPdf", { invoiceId: 5, preventSendBy: "no" }],
       ["voucherFactorySaveVoucher", {}],
     ];

@@ -135,14 +135,14 @@ essentials.
 | Variable | Default | Purpose |
 |---|---|---|
 | `SEVDESK_API_TOKEN` | *(required)* | Your sevDesk API token |
-| `SEVDESK_READ_ONLY` | `false` | Hide write tools; `sevdesk_call` stays listed but refuses mutating operations at call time |
-| `SEVDESK_DRY_RUN` | `false` | Show what a write *would* send, without sending it |
+| `SEVDESK_READ_ONLY` | `false` | Boolean (`1/true/yes/on` or `0/false/no/off`; anything else fails at startup). Hide write tools; `sevdesk_call` stays listed but refuses mutating operations at call time |
+| `SEVDESK_DRY_RUN` | `false` | Boolean, same accepted values. Show what a write *would* send, without sending it |
 | `SEVDESK_RECEIPT_DIRS` | *(unset — file tools disabled)* | Allowlist of **absolute** directories the receipt file tools may read and write, separated by the platform path separator (`:` on macOS/Linux, `;` on Windows). Symlinks are resolved, so a link pointing outside the list is refused |
 | `SEVDESK_BASE_URL` | `https://my.sevdesk.de/api/v1` | Override the API host. Must be `https://` (the token is sent as a header); plain `http://` is accepted only for `localhost`, `127.0.0.1` and `[::1]` |
-| `SEVDESK_TIMEOUT_MS` | `30000` | Per-request timeout |
-| `SEVDESK_MAX_RETRIES` | `3` | Retries with jittered backoff and a clamped `Retry-After`. A 429 is always retried (the throttled call never ran); a 5xx or network failure is retried **only for reads** — a write is never replayed on an ambiguous failure, so a timeout cannot create a duplicate draft |
+| `SEVDESK_TIMEOUT_MS` | `30000` | Per-request timeout (whole number > 0) |
+| `SEVDESK_MAX_RETRIES` | `3` | Whole number >= 0; `0` means no retries at all. Retries with jittered backoff and a clamped `Retry-After`. A 429 is always retried (the throttled call never ran); a 5xx or network failure is retried **only for reads** — a write is never replayed on an ambiguous failure, so a timeout cannot create a duplicate draft |
 | `SEVDESK_RATE_LIMIT` | `4` | Client-side pacing in requests/second (token bucket), so bursty audit fan-outs don't collide with sevDesk's throttle. `0` disables pacing |
-| `SEVDESK_DEBUG` | `false` | Log `METHOD /path -> status` to stderr — never query strings, bodies or the token |
+| `SEVDESK_DEBUG` | `false` | Boolean, same accepted values. Log `METHOD /path -> status` to stderr — never query strings, bodies or the token |
 
 Set these in the `env` block of your MCP client — that is the supported path and the
 one the client controls. For runs outside a client (`npm run dev`, `node dist/index.js`

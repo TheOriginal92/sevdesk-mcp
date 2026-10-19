@@ -1,5 +1,5 @@
 import { readFile, stat, writeFile } from "node:fs/promises";
-import { basename, extname, join, resolve } from "node:path";
+import { basename, extname, isAbsolute, join, resolve } from "node:path";
 
 import {
   INVOICE_STATUS,
@@ -17,6 +17,8 @@ import {
   assertAllowedDir,
   assertAllowedPath,
   bool,
+  getAllCapped,
+  truncationFields,
   int,
   isDryRun,
   isPlainObject,
@@ -136,7 +138,7 @@ const listVouchers: ToolDef = {
     const wanted = optString(args, "status");
     const limit = optLimit(args, "limit", 200, 1000);
 
-    const all = await ctx.client.getAll<Row>("/Voucher", { embed: "supplier,taxRule" }, { maxItems: 2000 });
+    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/Voucher", { embed: "supplier,taxRule" }, 2000);
 
     const rows = all
       .filter((v) => within(parseSevdeskDate(v.voucherDate), p))
@@ -167,7 +169,12 @@ const listVouchers: ToolDef = {
       })
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
 
-    return { total: rows.length, returned: Math.min(rows.length, limit), vouchers: rows.slice(0, limit) };
+    return {
+      total: rows.length,
+      returned: Math.min(rows.length, limit),
+      ...truncationFields(truncated, { what: "vouchers", cap: 2000 }),
+      vouchers: rows.slice(0, limit),
+    };
   },
 };
 
@@ -247,7 +254,7 @@ const listInvoices: ToolDef = {
   async handler(args, ctx) {
     const p = period(args);
     const limit = optLimit(args, "limit", 200, 1000);
-    const all = await ctx.client.getAll<Row>("/Invoice", { embed: "contact,taxRule" }, { maxItems: 2000 });
+    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/Invoice", { embed: "contact,taxRule" }, 2000);
     const rows = all
       .filter((i) => within(parseSevdeskDate(i.invoiceDate), p))
       .map((i) => {
@@ -267,7 +274,7 @@ const listInvoices: ToolDef = {
         };
       })
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
-    return { total: rows.length, returned: Math.min(rows.length, limit), invoices: rows.slice(0, limit) };
+    return { total: rows.length, returned: Math.min(rows.length, limit), ...truncationFields(truncated, { what: "invoices", cap: 2000 }), invoices: rows.slice(0, limit) };
   },
 };
 
@@ -311,11 +318,10 @@ const summarize: ToolDef = {
     const maxGroups = optLimit(args, "maxGroups", 40, 1000);
 
     const MAX_ITEMS = 10_000;
-    const rows =
+    const { rows, truncated } =
       kind === "invoices"
-        ? await ctx.client.getAll<Row>("/Invoice", { embed: "contact" }, { maxItems: MAX_ITEMS })
-        : await ctx.client.getAll<Row>("/Voucher", { embed: "supplier" }, { maxItems: MAX_ITEMS });
-    const truncated = rows.length >= MAX_ITEMS;
+        ? await getAllCapped<Row>(ctx, "/Invoice", { embed: "contact" }, MAX_ITEMS)
+        : await getAllCapped<Row>(ctx, "/Voucher", { embed: "supplier" }, MAX_ITEMS);
 
     const statusMap = kind === "invoices" ? INVOICE_STATUS : VOUCHER_STATUS;
     const keyOf = (r: Row, d: Date | null): string => {
@@ -384,7 +390,7 @@ const summarize: ToolDef = {
       scanned: rows.length,
       matched,
       ...(truncated
-        ? { truncated: true, note: `Only the first ${MAX_ITEMS} rows were scanned.` }
+        ? truncationFields(true, { what: kind, cap: MAX_ITEMS })
         : {}),
       total: {
         count: total.count,
@@ -419,7 +425,7 @@ const listContacts: ToolDef = {
   async handler(args, ctx) {
     const search = optString(args, "search")?.toLowerCase();
     const limit = optLimit(args, "limit", 200, 1000);
-    const all = await ctx.client.getAll<Row>("/Contact", {}, { maxItems: 5000 });
+    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/Contact", {}, 5000);
     const rows = all
       .map((c) => ({
         id: String(c.id ?? ""),
@@ -429,7 +435,7 @@ const listContacts: ToolDef = {
         taxNumber: c.taxNumber ?? null,
       }))
       .filter((c) => !search || String(c.name).toLowerCase().includes(search));
-    return { total: rows.length, returned: Math.min(rows.length, limit), contacts: rows.slice(0, limit) };
+    return { total: rows.length, returned: Math.min(rows.length, limit), ...truncationFields(truncated, { what: "contacts", cap: 5000 }), contacts: rows.slice(0, limit) };
   },
 };
 
@@ -457,7 +463,7 @@ const listTransactions: ToolDef = {
       query["checkAccount[id]"] = accountId;
       query["checkAccount[objectName]"] = "CheckAccount";
     }
-    const all = await ctx.client.getAll<Row>("/CheckAccountTransaction", query, { maxItems: 5000 });
+    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/CheckAccountTransaction", query, 5000);
     const rows = all
       .filter((t) => within(parseSevdeskDate(t.valueDate ?? t.entryDate), p))
       .map((t) => {
@@ -472,7 +478,7 @@ const listTransactions: ToolDef = {
         };
       })
       .sort((a, b) => String(b.date).localeCompare(String(a.date)));
-    return { total: rows.length, returned: Math.min(rows.length, limit), transactions: rows.slice(0, limit) };
+    return { total: rows.length, returned: Math.min(rows.length, limit), ...truncationFields(truncated, { what: "transactions", cap: 5000 }), transactions: rows.slice(0, limit) };
   },
 };
 
@@ -504,7 +510,10 @@ const uploadVoucherFile: ToolDef = {
     additionalProperties: false,
   },
   async handler(args, ctx) {
-    const requested = resolve(requireString(args, "filePath"));
+    const rawPath = requireString(args, "filePath");
+    // Before resolve(): a relative path would otherwise be anchored to the cwd and pass.
+    if (!isAbsolute(rawPath)) throw new Error("File path must be absolute.");
+    const requested = resolve(rawPath);
     // Containment and I/O use the real path; the name and content type come
     // from what the caller asked for, so an allowlisted alias.pdf link works.
     const path = await assertAllowedPath(ctx, requested);
@@ -964,16 +973,29 @@ const createInvoice: ToolDef = {
       if (typeof p.price !== "number" || !Number.isFinite(p.price)) {
         throw new Error(`Position ${i + 1}: price must be a finite number.`);
       }
+      const taxRate = typeof p.taxRate === "number" ? p.taxRate : (defaultRate as number);
+      if (rule.allowedRates !== null && !(rule.allowedRates as readonly number[]).includes(taxRate)) {
+        throw new Error(
+          `Position ${i + 1}: taxRate ${taxRate} is not allowed with rule ${ruleId} ("${rule.label}") — ` +
+            `allowed: ${rule.allowedRates.join(", ")}.`,
+        );
+      }
       return {
         objectName: "InvoicePos",
         mapAll: true,
         name: p.name,
         quantity,
         price: p.price,
-        taxRate: typeof p.taxRate === "number" ? p.taxRate : (defaultRate as number),
+        taxRate,
         unity: { id: 1, objectName: "Unity" },
       };
     });
+
+    // The invoice-level rate/text follow the positions when they agree. When
+    // they differ no single percentage is true, so keep the rule's default
+    // rate and use the rule's label as text rather than state one rate.
+    const rates = new Set(invoicePosSave.map((p) => p.taxRate));
+    const uniformRate = rates.size === 1 ? invoicePosSave[0]!.taxRate : null;
 
     const body = {
       invoice: {
@@ -986,12 +1008,12 @@ const createInvoice: ToolDef = {
         currency: optString(args, "currency") ?? "EUR",
         contact: { id: Number(contactId), objectName: "Contact" },
         taxRule: { id: ruleId, objectName: "TaxRule" },
-        taxRate: defaultRate ?? num(invoicePosSave[0]?.taxRate),
+        taxRate: uniformRate ?? defaultRate ?? num(invoicePosSave[0]?.taxRate),
         taxText:
           ruleId === "11"
             ? "Gemäß § 19 UStG wird keine Umsatzsteuer berechnet."
-            : defaultRate && defaultRate > 0
-              ? `Umsatzsteuer ${defaultRate}%`
+            : uniformRate !== null && uniformRate > 0
+              ? `Umsatzsteuer ${uniformRate}%`
               : rule.label,
         discount: 0,
         ...(optString(args, "header") ? { header: optString(args, "header") } : {}),
@@ -1065,7 +1087,7 @@ const getInvoicePdf: ToolDef = {
     // The filename comes from the API — keep only its basename so it cannot
     // point outside the allowlisted directory.
     let filename = basename(String(meta?.filename ?? ""));
-    if (filename === "" || filename === "." || filename === "..") filename = `invoice-${id}.pdf`;
+    if (!/^[\w.\- ]+\.pdf$/i.test(filename) || filename.startsWith("..")) filename = `invoice-${id}.pdf`;
     const target = join(dir, filename);
     const bytes = Buffer.from(content, "base64");
     // flag wx: never clobber an existing file in the user's receipt archive.

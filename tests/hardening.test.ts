@@ -15,6 +15,7 @@ import {
   type ToolContext,
 } from "../src/lib/tool.js";
 import { MAX_OUTPUT_CHARS, capOutput, tools } from "../src/server.js";
+import { catalog } from "../src/catalog.js";
 
 type Row = Record<string, unknown>;
 const env = (extra: Record<string, string>) => ({ SEVDESK_API_TOKEN: "t", ...extra });
@@ -549,5 +550,178 @@ describe("round 4", () => {
     expect(optRange({ x: 2.9 }, "x", 1, 0, 10, true)).toBe(2);
     expect(optRange({ x: 2.9 }, "x", 1, 0, 10)).toBe(2.9);
     expect(optRange({ x: 99 }, "x", 1, 0, 10)).toBe(10);
+  });
+});
+
+describe("round 5", () => {
+  const dry = { client: {}, config: { readOnly: false, dryRun: false } } as unknown as ToolContext;
+
+  it("refuses relative upload paths even when the cwd is inside the allowlist", async () => {
+    const root = await mkdtemp(join(tmpdir(), "sevdesk-mcp-rel-"));
+    await writeFile(join(root, "receipt.pdf"), "x");
+    const cx = { client: {}, config: { readOnly: false, dryRun: true, allowedReceiptDirs: [root] } } as unknown as ToolContext;
+    const cwd = process.cwd();
+    try {
+      process.chdir(root);
+    } catch {
+      /* worker without chdir: the relative-path check does not depend on it */
+    }
+    try {
+      for (const p of ["receipt.pdf", "../x.pdf"]) {
+        await expect(tool("sevdesk_upload_voucher_file").handler({ filePath: p }, cx)).rejects.toThrow(/absolute/);
+      }
+    } finally {
+      try { process.chdir(cwd); } catch { /* ignore */ }
+    }
+  });
+
+  it("validates explicit invoice rates against the rule and derives the invoice text", async () => {
+    const create = tool("sevdesk_create_invoice");
+    const run = (taxRuleId: string, rates: Array<number | undefined>) =>
+      create.handler(
+        { contactId: 1, taxRuleId, dryRun: true, positions: rates.map((taxRate) => ({ name: "x", price: 1, taxRate })) },
+        dry,
+      ) as Promise<{ wouldSend: { body: { invoice: Row } } }>;
+    await expect(run("11", [19])).rejects.toThrow(/Position 1: taxRate 19 is not allowed with rule 11/);
+    const seven = (await run("1", [7, 7])).wouldSend.body.invoice;
+    expect(seven).toMatchObject({ taxRate: 7, taxText: "Umsatzsteuer 7%" });
+    const mixed = (await run("1", [7, 19])).wouldSend.body.invoice;
+    expect(mixed.taxRate).toBe(19);
+    expect(String(mixed.taxText)).not.toMatch(/Umsatzsteuer \d/);
+    expect((await run("11", [0])).wouldSend.body.invoice.taxText).toMatch(/§ 19 UStG/);
+  });
+
+  it("refuses an unparseable dryRun instead of writing, and reads 1 / ' TRUE '", async () => {
+    const create = tool("sevdesk_create_invoice");
+    const a = { contactId: 1, taxRuleId: "1", positions: [{ name: "x", price: 1 }] };
+    for (const bad of ["dry", 2, {}]) {
+      await expect(create.handler({ ...a, dryRun: bad }, dry)).rejects.toThrow("dryRun must be true or false.");
+    }
+    for (const ok of [1, " TRUE ", "on"]) {
+      await expect(create.handler({ ...a, dryRun: ok }, dry)).resolves.toMatchObject({ dryRun: true });
+    }
+  });
+
+  it("parses boolean and numeric env vars strictly", () => {
+    for (const [k, v] of [["SEVDESK_READ_ONLY", "maybe"], ["SEVDESK_DRY_RUN", "2"], ["SEVDESK_DEBUG", "tru"]]) {
+      expect(() => loadConfig(env({ [k!]: v! }))).toThrow(new RegExp(k!));
+    }
+    expect(loadConfig(env({ SEVDESK_READ_ONLY: " ON " })).readOnly).toBe(true);
+    expect(loadConfig(env({ SEVDESK_READ_ONLY: "Off" })).readOnly).toBe(false);
+    expect(loadConfig(env({ SEVDESK_READ_ONLY: "" })).readOnly).toBe(false);
+    expect(loadConfig(env({ SEVDESK_MAX_RETRIES: "0" })).maxRetries).toBe(0);
+    expect(() => loadConfig(env({ SEVDESK_MAX_RETRIES: "-1" }))).toThrow(/SEVDESK_MAX_RETRIES/);
+    expect(() => loadConfig(env({ SEVDESK_MAX_RETRIES: "x" }))).toThrow(/SEVDESK_MAX_RETRIES/);
+    expect(() => loadConfig(env({ SEVDESK_TIMEOUT_MS: "0" }))).toThrow(/SEVDESK_TIMEOUT_MS/);
+  });
+
+  it("does not retry at all with SEVDESK_MAX_RETRIES=0, 429 included", async () => {
+    let calls = 0;
+    const client = new SevdeskClient(loadConfig(env({ SEVDESK_MAX_RETRIES: "0", SEVDESK_RATE_LIMIT: "0" })), {
+      fetchFn: (async () => (calls++, new Response("{}", { status: 429 }))) as typeof fetch,
+      sleep: async () => {},
+    });
+    await expect(client.request({ method: "GET", path: "/x" })).rejects.toBeInstanceOf(SevdeskApiError);
+    expect(calls).toBe(1);
+  });
+
+  it("sevdesk_call refuses unparseable preventSendBy / enshrine values and normalizes the rest", async () => {
+    const sent: Array<{ query?: Row }> = [];
+    const c = {
+      client: { async request(o: { query?: Row }) { sent.push(o); return { status: 200, data: {} }; } },
+      config: { readOnly: false, dryRun: false, baseUrl: "https://example.test/api/v1" },
+    } as unknown as ToolContext;
+    const call = tool("sevdesk_call");
+    await expect(
+      call.handler({ operationId: "invoiceGetPdf", params: { invoiceId: 1, preventSendBy: "maybe" } }, c),
+    ).rejects.toThrow("preventSendBy must be true or false.");
+    await expect(
+      call.handler({ operationId: "exportDatevCSV", params: { enshrineDocuments: {} } }, c),
+    ).rejects.toThrow("enshrineDocuments must be true or false.");
+    expect(sent).toHaveLength(0);
+    await call.handler({ operationId: "exportDatevCSV", params: { enshrineDocuments: "0" } }, c);
+    expect(sent[0]!.query!.enshrineDocuments).toBe(false);
+  });
+
+  it("list tools flag truncation but not an exact fit", async () => {
+    const mk = (n: number) =>
+      ({
+        client: {
+          getAll: async (_p: string, _q: unknown, o: { maxItems: number }) =>
+            Array.from({ length: Math.min(n, o.maxItems) }, (_, i) => ({ id: String(i), voucherDate: "2026-06-01", invoiceDate: "2026-06-01", valueDate: "2026-06-01" })),
+        },
+        config: {},
+      }) as unknown as ToolContext;
+    const caps: Record<string, number> = {
+      sevdesk_list_vouchers: 2000,
+      sevdesk_list_invoices: 2000,
+      sevdesk_list_contacts: 5000,
+      sevdesk_list_transactions: 5000,
+    };
+    for (const [name, cap] of Object.entries(caps)) {
+      const over = (await tool(name).handler({}, mk(cap + 1))) as Row;
+      expect(over.truncated, name).toBe(true);
+      expect(String(over.warning), name).toContain(String(cap));
+      const exact = (await tool(name).handler({}, mk(cap))) as Row;
+      expect(exact.truncated, name).toBe(false);
+      expect(exact).not.toHaveProperty("warning");
+    }
+  });
+
+  it("names transactions and maxItems when reconcile hits its transaction cap", async () => {
+    const c = {
+      client: {
+        getAll: async (p: string, _q: unknown, o: { maxItems: number }) =>
+          p === "/CheckAccountTransaction"
+            ? Array.from({ length: o.maxItems }, (_, i) => ({ id: String(i), valueDate: "2026-06-01", amount: 1 }))
+            : [],
+      },
+      config: {},
+    } as unknown as ToolContext;
+    const out = (await tool("sevdesk_reconcile_transactions").handler({ maxItems: 2 }, c)) as Row;
+    expect(out.truncated).toBe(true);
+    expect(String(out.warning)).toMatch(/transactions/);
+    expect(String(out.warning)).toMatch(/maxItems/);
+    expect(String(out.warning)).not.toMatch(/vouchers/);
+  });
+
+  it("pages voucher positions beyond one page and warns about unfetchable supplier contacts being cut", async () => {
+    const calls: string[] = [];
+    const c = {
+      client: {
+        getAll: async (p: string) => {
+          calls.push(p);
+          if (p === "/Voucher")
+            return [{ id: "1", voucherDate: "2026-06-01", creditDebit: "C", status: "100", supplierName: "A", sumGross: 1 }];
+          if (p === "/Contact") return Array.from({ length: 2001 }, (_, i) => ({ id: String(i), name: "c" + i }));
+          return [];
+        },
+        request: async () => ({ status: 200, data: { objects: [] } }),
+      },
+      config: {},
+    } as unknown as ToolContext;
+    const out = (await tool("sevdesk_audit_vat").handler({}, c)) as { warnings: string[] };
+    expect(calls).toContain("/VoucherPos");
+    expect(out.warnings.join(" ")).toMatch(/contacts.*supplier-name heuristic/);
+  });
+
+  it("only accepts plain .pdf names from the API", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "sevdesk-mcp-fname-"));
+    const save = async (filename: string) => {
+      const c = {
+        client: { request: async () => ({ status: 200, data: { content: Buffer.from("x").toString("base64"), filename } }) },
+        config: { readOnly: false, dryRun: false, allowedReceiptDirs: [dir] },
+      } as unknown as ToolContext;
+      return ((await tool("sevdesk_get_invoice_pdf").handler({ invoiceId: 3, directory: dir }, c)) as { saved: string }).saved;
+    };
+    expect(await save("RE 2026-1.PDF")).toMatch(/RE 2026-1\.PDF$/);
+    expect(await save("evil.sh")).toMatch(/invoice-3\.pdf$/);
+  });
+
+  it("every path parameter in the catalog is an integer or number", () => {
+    const bad = catalog.operations.flatMap((o) =>
+      o.params.filter((p) => p.in === "path" && p.type !== "integer" && p.type !== "number").map((p) => `${o.operationId}.${p.name}:${p.type}`),
+    );
+    expect(bad).toEqual([]);
   });
 });

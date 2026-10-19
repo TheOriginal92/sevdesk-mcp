@@ -22,21 +22,30 @@ export interface Config {
   allowedReceiptDirs: string[];
 }
 
-function bool(value: string | undefined, fallback = false): boolean {
-  if (value === undefined) return fallback;
-  return ["1", "true", "yes", "on"].includes(value.trim().toLowerCase());
+function bool(name: string, value: string | undefined, fallback = false): boolean {
+  const t = value?.trim().toLowerCase() ?? "";
+  if (t === "") return fallback;
+  if (["1", "true", "yes", "on"].includes(t)) return true;
+  if (["0", "false", "no", "off"].includes(t)) return false;
+  throw new Error(`${name} must be one of 1/true/yes/on or 0/false/no/off (got '${value}').`);
 }
 
-function int(value: string | undefined, fallback: number): number {
-  const n = Number.parseInt(value ?? "", 10);
-  return Number.isFinite(n) && n > 0 ? n : fallback;
+/** A whole number >= min; empty means the default, anything else invalid throws. */
+function int(name: string, value: string | undefined, fallback: number, min: number): number {
+  const t = value?.trim() ?? "";
+  if (t === "") return fallback;
+  const n = Number(t);
+  if (!Number.isInteger(n) || n < min) throw new Error(`${name} must be a whole number >= ${min} (got '${value}').`);
+  return n;
 }
 
-/** Like {@link int} but fractional and with an explicit 0 meaning "disabled". */
-function rate(value: string | undefined, fallback: number): number {
-  if (value === undefined || value.trim() === "") return fallback;
-  const n = Number(value);
-  return Number.isFinite(n) && n >= 0 ? n : fallback;
+/** Fractional, with an explicit 0 meaning "disabled". */
+function rate(name: string, value: string | undefined, fallback: number): number {
+  const t = value?.trim() ?? "";
+  if (t === "") return fallback;
+  const n = Number(t);
+  if (!Number.isFinite(n) || n < 0) throw new Error(`${name} must be a number >= 0 (got '${value}').`);
+  return n;
 }
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
@@ -99,12 +108,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return {
     apiToken,
     baseUrl: parseBaseUrl(env.SEVDESK_BASE_URL ?? "https://my.sevdesk.de/api/v1"),
-    readOnly: bool(env.SEVDESK_READ_ONLY, false),
-    dryRun: bool(env.SEVDESK_DRY_RUN, false),
-    requestTimeoutMs: int(env.SEVDESK_TIMEOUT_MS, 30_000),
-    maxRetries: int(env.SEVDESK_MAX_RETRIES, 3),
-    rateLimitPerSec: rate(env.SEVDESK_RATE_LIMIT, 4),
-    debug: bool(env.SEVDESK_DEBUG, false),
+    readOnly: bool("SEVDESK_READ_ONLY", env.SEVDESK_READ_ONLY),
+    dryRun: bool("SEVDESK_DRY_RUN", env.SEVDESK_DRY_RUN),
+    requestTimeoutMs: int("SEVDESK_TIMEOUT_MS", env.SEVDESK_TIMEOUT_MS, 30_000, 1),
+    maxRetries: int("SEVDESK_MAX_RETRIES", env.SEVDESK_MAX_RETRIES, 3, 0),
+    rateLimitPerSec: rate("SEVDESK_RATE_LIMIT", env.SEVDESK_RATE_LIMIT, 4),
+    debug: bool("SEVDESK_DEBUG", env.SEVDESK_DEBUG),
     allowedReceiptDirs: parseReceiptDirs(env.SEVDESK_RECEIPT_DIRS),
   };
 }

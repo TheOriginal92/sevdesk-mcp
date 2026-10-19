@@ -18,6 +18,8 @@ import {
 } from "../lib/vat.js";
 import {
   assertAllowedDir,
+  getAllCapped,
+  truncationFields,
   bool,
   int,
   optBool,
@@ -101,22 +103,14 @@ async function fetchVouchersCapped(
   period: PeriodArgs,
   maxItems: number,
 ): Promise<{ vouchers: Row[]; truncated: boolean }> {
-  const query: Record<string, unknown> = { embed: "supplier,taxRule" };
-  // One extra row tells "exactly at the cap" from "more behind it".
-  const all = await ctx.client.getAll<Row>("/Voucher", query, { maxItems: maxItems + 1 });
+  const { rows, truncated } = await getAllCapped<Row>(ctx, "/Voucher", { embed: "supplier,taxRule" }, maxItems);
   return {
-    vouchers: all.slice(0, maxItems).filter((v) => inPeriod(parseSevdeskDate(v.voucherDate), period)),
-    truncated: all.length > maxItems,
+    vouchers: rows.filter((v) => inPeriod(parseSevdeskDate(v.voucherDate), period)),
+    truncated,
   };
 }
 
-/** The cap applies to the ledger before the date filter, so the period itself may be incomplete. */
-function truncationWarning(maxItems: number): string {
-  return (
-    `Only the first ${maxItems} vouchers of the ledger were scanned, before the date filter was applied, ` +
-    "so vouchers in the period may be missing. Raise maxVouchers."
-  );
-}
+const voucherCap = (cap: number) => ({ what: "vouchers", cap, param: "maxVouchers" });
 
 async function fetchPositions(
   ctx: ToolContext,
@@ -128,12 +122,17 @@ async function fetchPositions(
     const id = String(v.id ?? "");
     if (!id) return;
     try {
-      const { data } = await ctx.client.request<{ objects?: Row[] }>({
-        method: "GET",
-        path: "/VoucherPos",
-        query: { "voucher[id]": id, "voucher[objectName]": "Voucher", limit: 200 },
-      });
-      positions.set(id, data?.objects ?? []);
+      // Paged: a voucher can carry more positions than one page returns.
+      const { rows, truncated } = await getAllCapped<Row>(
+        ctx,
+        "/VoucherPos",
+        { "voucher[id]": id, "voucher[objectName]": "Voucher" },
+        5000,
+      );
+      positions.set(id, rows);
+      if (truncated) {
+        warnings.push(`Voucher ${id} has more than 5000 positions; only the first 5000 were checked.`);
+      }
     } catch (err) {
       // A failed fetch must not fail the whole audit, but silently treating it
       // as "no positions" would suppress rate-based findings — say so.
@@ -156,10 +155,11 @@ async function fetchSupplierCountries(
 ): Promise<{ countries: Map<string, string>; warnings: string[] }> {
   const countries = new Map<string, string>();
   try {
-    const contacts = await ctx.client.getAll<Row>(
+    const { rows: contacts, truncated } = await getAllCapped<Row>(
+      ctx,
       "/Contact",
       { depth: 1, embed: "addresses,addresses.country" },
-      { maxItems: 2000 },
+      2000,
     );
     for (const c of contacts) {
       const key = supplierKey(c.name);
@@ -170,7 +170,13 @@ async function fetchSupplierCountries(
         .find(Boolean);
       if (code) countries.set(key, code);
     }
-    return { countries, warnings: [] };
+    const t = truncationFields(truncated, { what: "contacts", cap: 2000 });
+    return {
+      countries,
+      warnings: t.warning
+        ? [`${t.warning} Suppliers beyond that fall back to the supplier-name heuristic for country checks.`]
+        : [],
+    };
   } catch (err) {
     return {
       countries,
@@ -292,7 +298,10 @@ const auditVat: ToolDef = {
     const { positions } = posResult;
     const { countries } = contactResult;
     const warnings = [...posResult.warnings, ...contactResult.warnings, ...guidance.warnings];
-    if (truncated) warnings.push(truncationWarning(maxVouchers));
+    {
+      const t = truncationFields(truncated, voucherCap(maxVouchers));
+      if (t.warning) warnings.push(t.warning);
+    }
 
     const findings: Finding[] = [];
 
@@ -581,7 +590,10 @@ const reverseChargeReport: ToolDef = {
       fetchVouchersCapped(ctx, period, maxVouchers),
       fetchSupplierCountries(ctx),
     ]);
-    if (truncated) warnings.push(truncationWarning(maxVouchers));
+    {
+      const t = truncationFields(truncated, voucherCap(maxVouchers));
+      if (t.warning) warnings.push(t.warning);
+    }
 
     const deductible: Row[] = [];
     const nonDeductible: Row[] = [];
@@ -756,7 +768,7 @@ const findDuplicates: ToolDef = {
 
     return {
       vouchersExamined: vouchers.length,
-      ...(truncated ? { truncated, warning: truncationWarning(maxVouchers) } : { truncated }),
+      ...truncationFields(truncated, voucherCap(maxVouchers)),
       duplicateDocumentNumbers: sameNumber,
       sameSupplierSameAmount: sameAmount,
       notYetBooked: unfinished,
@@ -843,7 +855,7 @@ const subscriptionGaps: ToolDef = {
     return {
       period: periodLabel(period),
       monthsCovered: allMonths,
-      ...(truncated ? { truncated, warning: truncationWarning(maxVouchers) } : { truncated }),
+      ...truncationFields(truncated, voucherCap(maxVouchers)),
       recurringSuppliersWithGaps: results.length,
       estimatedTotalMissing: round2(results.reduce((s, r) => s + num(r.estimatedMissingValue), 0)),
       results,
@@ -1000,13 +1012,9 @@ const diffReceiptFolder: ToolDef = {
       directory: target,
       filesScanned: files.length,
       vouchersExamined: vouchers.length,
-      truncated,
+      ...truncationFields(truncated, voucherCap(maxVouchers)),
       ...(truncated
-        ? {
-            warning:
-              `Fetched only the first ${maxVouchers} vouchers: vouchersWithoutFile may be incomplete and ` +
-              "files may be wrongly listed as unmatched. Narrow from/to or raise maxVouchers.",
-          }
+        ? { note: "Truncated: vouchersWithoutFile may be incomplete and files may be wrongly listed as unmatched." }
         : {}),
       matched: matchedVoucherIds.size,
       filesWithoutVoucher: { count: unmatchedFiles.length, items: unmatchedFiles },
@@ -1052,12 +1060,15 @@ const reconcileTransactions: ToolDef = {
     const window = optRange(args, "dayWindow", 5, 0, 366, true);
     const maxItems = optLimit(args, "maxItems", 2000, 20_000);
 
-    const [allTransactions, { vouchers, truncated: vouchersTruncated }] = await Promise.all([
-      ctx.client.getAll<Row>("/CheckAccountTransaction", {}, { maxItems: maxItems + 1 }),
-      fetchVouchersCapped(ctx, period, maxItems),
-    ]);
-    const transactions = allTransactions.slice(0, maxItems);
-    const truncated = vouchersTruncated || allTransactions.length > maxItems;
+    const [{ rows: transactions, truncated: txTruncated }, { vouchers, truncated: vouchersTruncated }] =
+      await Promise.all([
+        getAllCapped<Row>(ctx, "/CheckAccountTransaction", {}, maxItems),
+        fetchVouchersCapped(ctx, period, maxItems),
+      ]);
+    const cutWarnings = [
+      truncationFields(vouchersTruncated, { what: "vouchers", cap: maxItems, param: "maxItems" }).warning,
+      truncationFields(txTruncated, { what: "transactions", cap: maxItems, param: "maxItems" }).warning,
+    ].filter(Boolean);
     const txs = transactions.filter((t) => inPeriod(parseSevdeskDate(t.valueDate), period));
 
     const candidates = vouchers.map((v) => ({
@@ -1106,7 +1117,8 @@ const reconcileTransactions: ToolDef = {
       period: periodLabel(period),
       transactionsExamined: txs.length,
       vouchersExamined: vouchers.length,
-      ...(truncated ? { truncated, warning: truncationWarning(maxItems) } : { truncated }),
+      truncated: cutWarnings.length > 0,
+      ...(cutWarnings.length ? { warning: cutWarnings.join(" ") } : {}),
       matched,
       unmatchedTransactions,
       vouchersWithoutPayment,
@@ -1152,11 +1164,8 @@ const invoiceAging: ToolDef = {
   },
   async handler(args, ctx) {
     const period = readPeriod(args);
-    const all = await ctx.client.getAll<Row>(
-      "/Invoice",
-      { embed: "contact" },
-      { maxItems: optLimit(args, "maxItems", 2000, 20_000) },
-    );
+    const maxItems = optLimit(args, "maxItems", 2000, 20_000);
+    const { rows: all, truncated } = await getAllCapped<Row>(ctx, "/Invoice", { embed: "contact" }, maxItems);
     const invoices = all.filter((i) => inPeriod(parseSevdeskDate(i.invoiceDate), period));
     const now = new Date();
 
@@ -1227,6 +1236,7 @@ const invoiceAging: ToolDef = {
     return {
       period: periodLabel(period),
       invoicesExamined: invoices.length,
+      ...truncationFields(truncated, { what: "invoices", cap: maxItems, param: "maxItems" }),
       outstandingTotal,
       aging,
       drafts,
