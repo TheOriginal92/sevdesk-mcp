@@ -58,6 +58,20 @@ jobs:
             npm publish --provenance --access public
           fi
 
+      # The MCP registry validates against npm, and a fresh npm version takes a
+      # few minutes to become visible (v0.5.0 was refused with a 404 for that).
+      - name: Wait for the version to appear on npm
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          for _ in $(seq 1 30); do
+            if [ "$(npm view "sevdesk-mcp@${VERSION}" version --prefer-online 2>/dev/null)" = "${VERSION}" ]; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "sevdesk-mcp@${VERSION} did not appear on npm within 5 minutes." >&2
+          exit 1
+
       - name: Publish to the MCP registry
         run: |
           "$RUNNER_TEMP/mcp-publisher" login github-oidc
